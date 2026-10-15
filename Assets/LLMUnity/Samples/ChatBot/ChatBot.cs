@@ -5,6 +5,7 @@ using LLMUnity;
 using UnityEngine.UI;
 using System.Collections;
 using System.Linq;
+using VRMate;
 
 namespace LLMUnitySamples
 {
@@ -74,7 +75,13 @@ namespace LLMUnitySamples
 
         private Animator avatarAnimator;
         private Animator lastAvatarAnimator;
-        private static readonly int isTalkingHash = Animator.StringToHash("isTalking");
+
+        // VRMate: replies come from the brain through SpeechPlayer instead of LLMUnity.
+        private const string notConnectedPlaceholder = "頭脳につながっていません";
+        private SpeechPlayer speechPlayer;
+        private Bubble currentAiBubble;
+        private long currentAiTurn;
+        private bool? placeholderConnected;
 
 
         void Start()
@@ -123,9 +130,51 @@ namespace LLMUnitySamples
             inputBubble.AddValueChangedListener(onValueChanged);
             inputBubble.setInteractable(false);
 
-            ShowLoadedMessages();
-            _ = llmCharacter.Warmup(WarmUpCallback);
             FindAvatarSmart();
+
+            // VRMate: no LLMUnity warm-up or history; input is open as soon as the panel exists.
+            SubscribeSpeechPlayer();
+            warmUpDone = true;
+            UpdateConnectionPlaceholder();
+            AllowInput();
+        }
+
+        void SubscribeSpeechPlayer()
+        {
+            if (speechPlayer != null || SpeechPlayer.Instance == null) return;
+            speechPlayer = SpeechPlayer.Instance;
+            speechPlayer.TextAppended += OnSpeechTextAppended;
+        }
+
+        void OnDestroy()
+        {
+            if (speechPlayer != null) speechPlayer.TextAppended -= OnSpeechTextAppended;
+            speechPlayer = null;
+        }
+
+        void OnSpeechTextAppended(long turn, string text)
+        {
+            if (inputBubble == null || string.IsNullOrEmpty(text)) return;
+
+            // One AI bubble per turn; a trimmed bubble cannot be appended to, so start a new one.
+            if (currentAiBubble == null || turn != currentAiTurn || !chatBubbles.Contains(currentAiBubble))
+            {
+                currentAiBubble = AddBubble(text, false);
+                currentAiTurn = turn;
+            }
+            else
+            {
+                currentAiBubble.SetText(currentAiBubble.GetText() + text);
+                layoutDirty = true;
+            }
+        }
+
+        void UpdateConnectionPlaceholder()
+        {
+            bool connected = BrainLink.Instance != null && BrainLink.Instance.IsConnected;
+            if (placeholderConnected == connected) return;
+            placeholderConnected = connected;
+            inputBubble.SetPlaceHolderText(connected ? inputPlaceholder : notConnectedPlaceholder);
         }
 
         void FindAvatarSmart()
@@ -173,9 +222,8 @@ namespace LLMUnitySamples
             if (streamAudioSource != null && streamAudioSource.isPlaying)
             {
                 streamAudioSource.Stop();
-                streamAudioSource.volume = 1f; 
+                streamAudioSource.volume = 1f;
             }
-            if (avatarAnimator != null) avatarAnimator.SetBool(isTalkingHash, false);
         }
 
         Bubble AddBubble(string message, bool isPlayerMessage)
@@ -199,7 +247,8 @@ namespace LLMUnitySamples
                 }
             }
 
-            if (autoScrollOnNewMessage && (!respectUserScroll || IsAtBottom()))
+            // VRMate: replies may arrive while the panel is closed, when coroutines cannot start.
+            if (isActiveAndEnabled && autoScrollOnNewMessage && (!respectUserScroll || IsAtBottom()))
             {
                 StartCoroutine(ScrollToBottomNextFrame());
             }
@@ -256,33 +305,19 @@ namespace LLMUnitySamples
                 StartCoroutine(BlockInteraction());
                 return;
             }
-            blockInput = true;
-
             string message = inputBubble.GetText().Replace("\v", "\n");
 
+            // VRMate: the brain handles interruptions, so input stays open while it is replying.
+            var result = BrainLink.Instance != null ? BrainLink.Instance.SendInput(message) : InputSendResult.NotConnected;
+            if (result != InputSendResult.Sent)
+            {
+                if (result == InputSendResult.TooLong) Debug.LogWarning("[VRMate] input is too long to send");
+                UpdateConnectionPlaceholder();
+                StartCoroutine(BlockInteraction());
+                return;
+            }
+
             AddBubble(message, true);
-            Bubble aiBubble = AddBubble("...", false);
-
-            if (streamAudioSource != null)
-                streamAudioSource.Play();
-            if (avatarAnimator != null) avatarAnimator.SetBool(isTalkingHash, true);
-
-            Task chatTask = llmCharacter.Chat(
-                message,
-                (partial) => { aiBubble.SetText(partial); layoutDirty = true; },
-                () =>
-                {
-                    if (avatarAnimator != null) avatarAnimator.SetBool(isTalkingHash, false);
-
-                    aiBubble.SetText(aiBubble.GetText());
-                    layoutDirty = true;
-
-                    if (streamAudioSource != null && streamAudioSource.isPlaying)
-                        StartCoroutine(FadeOutStreamAudio());
-
-                    AllowInput();
-                }
-            );
             inputBubble.SetText("");
         }
 
@@ -315,7 +350,6 @@ namespace LLMUnitySamples
 
         public void CancelRequests()
         {
-            llmCharacter.CancelRequests();
             AllowInput();
         }
 
@@ -363,6 +397,8 @@ namespace LLMUnitySamples
         void Update()
         {
             RefreshAvatarIfChanged();
+            SubscribeSpeechPlayer();
+            UpdateConnectionPlaceholder();
 
             if (!inputBubble.inputFocused() && warmUpDone)
             {

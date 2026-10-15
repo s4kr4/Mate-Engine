@@ -14,6 +14,9 @@ Assets/StreamingAssets/Qwen3-1.7B-Q4_K_M.gguf
 Assets/StreamingAssets/Qwen3-4B-Q2_K.gguf
 Assets/StreamingAssets/Qwen3-4B-Q4_K_M.gguf
 Assets/StreamingAssets/undreamai-v1.2.5-llamacpp
+# LLMUnity writes this on every build (model list and settings only)
+Assets/StreamingAssets/LLMManager.json
+Assets/StreamingAssets/LLMManager.json.meta
 
 # Test Models
 Assets/MATE ENGINE - Test Station
