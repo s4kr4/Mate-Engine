@@ -40,8 +40,11 @@ namespace VRMate
 
         public static SpeechPlayer Instance { get; private set; }
 
-        /// <summary>Raised on the main thread when a say starts (or is shown without audio): turn, text.</summary>
-        public event Action<long, string> TextAppended;
+        /// <summary>
+        /// Raised on the main thread when a say starts (or is shown without audio): connection, turn, text.
+        /// Turns restart when the brain reconnects, so one reply is the pair of connection and turn.
+        /// </summary>
+        public event Action<long, long, string> TextAppended;
 
         public void OnSay(SayMessage say)
         {
@@ -172,7 +175,7 @@ namespace VRMate
                 var handler = TextAppended;
                 if (handler != null)
                 {
-                    handler(append.Turn, append.Text);
+                    handler(append.Connection, append.Turn, append.Text);
                 }
 
                 return;

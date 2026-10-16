@@ -67,7 +67,7 @@ namespace VRMate.Tests
             var append = action as AppendText;
             if (append != null)
             {
-                return "AppendText(" + append.Turn + "," + append.Text + ")";
+                return "AppendText(c" + append.Connection + ",t" + append.Turn + "," + append.Text + ")";
             }
 
             var send = action as SendMessage;
@@ -617,10 +617,181 @@ namespace VRMate.Tests
             AssertPlayed(actions[0], 1, Describe(actions));
         }
 
+        // ---- 接続の番号 ----
+        // 吹き出しは接続の番号と turn の両方が同じ AppendText をまとめる。
+        // 頭脳を起動し直すと turn は数え直しになるので、切断のたびに接続の番号が変わる必要がある。
+
+        private static readonly SayKind[] AllSayKinds = { SayKind.TextOnly, SayKind.Audio, SayKind.BrokenAudio };
+
+        private static SayMessage SayOfKind(SayKind kind, long id, long turn, string text)
+        {
+            switch (kind)
+            {
+                case SayKind.TextOnly:
+                    return TextSay(id, turn, text);
+                case SayKind.Audio:
+                    return AudioSay(id, turn, text);
+                default:
+                    return BrokenAudioSay(id, TestJson.Quote(NotWavAudio), turn, text);
+            }
+        }
+
+        /// <summary>何も再生していない sequencer に say を渡し、その say の AppendText を返す。</summary>
+        private static AppendText AppendOf(SpeechSequencer sequencer, SayMessage say)
+        {
+            Assert.That(sequencer.IsPlaying, Is.False, "say を渡す前に再生を終わらせておく");
+            sequencer.OnSay(say);
+            var actions = Drain(sequencer);
+            var appends = actions.OfType<AppendText>().ToList();
+            Assert.That(appends.Count, Is.EqualTo(1), Describe(actions));
+            Assert.That(appends[0].Text, Is.EqualTo(say.Text), Describe(actions));
+            return appends[0];
+        }
+
+        [Test]
+        public void AppendText_HasSameConnection_ForEverySayKindAndTurn_WhenNotDisconnected()
+        {
+            var sequencer = new SpeechSequencer();
+            var appends = new List<AppendText>();
+
+            appends.Add(AppendOf(sequencer, TextSay(1, turn: 1)));
+            appends.Add(AppendOf(sequencer, AudioSay(2, turn: 2)));
+            sequencer.OnPlaybackFinished(2);
+            Drain(sequencer);
+            appends.Add(AppendOf(sequencer, BrokenAudioSay(3, TestJson.Quote(NotWavAudio), turn: 3)));
+            appends.Add(AppendOf(sequencer, TextSay(4, turn: 1)));
+            sequencer.OnSay(AudioSay(5, turn: 4));
+            sequencer.OnSay(TextSay(6, turn: 5));
+            sequencer.OnPlaybackFinished(5);
+            appends.AddRange(Drain(sequencer).OfType<AppendText>());
+
+            Assert.That(appends.Count, Is.EqualTo(6), Describe(appends));
+            Assert.That(appends.Select(a => a.Connection).Distinct().Count(), Is.EqualTo(1), Describe(appends));
+        }
+
+        [Test]
+        public void AppendText_HasDifferentConnection_WhenSameTurnArrivesAfterDisconnect()
+        {
+            foreach (var turn in new[] { long.MinValue, -1L, 0L, 1L, long.MaxValue })
+            {
+                var sequencer = new SpeechSequencer();
+                var before = AppendOf(sequencer, TextSay(1, turn: turn, text: "前の頭脳"));
+
+                sequencer.OnDisconnected();
+                Drain(sequencer);
+                var after = AppendOf(sequencer, TextSay(1, turn: turn, text: "新しい頭脳"));
+
+                var because = "turn=" + turn + " " + Describe(new SpeechAction[] { before, after });
+                Assert.That(after.Turn, Is.EqualTo(before.Turn), because);
+                Assert.That(after.Connection, Is.Not.EqualTo(before.Connection), because);
+            }
+        }
+
+        [Test]
+        public void AppendText_HasDifferentConnection_AfterDisconnect_ForEverySayKindBeforeAndAfter()
+        {
+            foreach (var kindBefore in AllSayKinds)
+            {
+                foreach (var kindAfter in AllSayKinds)
+                {
+                    var sequencer = new SpeechSequencer();
+                    var before = AppendOf(sequencer, SayOfKind(kindBefore, 1, 1, "前の頭脳"));
+
+                    sequencer.OnDisconnected();
+                    Drain(sequencer);
+                    var after = AppendOf(sequencer, SayOfKind(kindAfter, 1, 1, "新しい頭脳"));
+
+                    var because = kindBefore + " -> " + kindAfter + " " + Describe(new SpeechAction[] { before, after });
+                    Assert.That(after.Connection, Is.Not.EqualTo(before.Connection), because);
+                }
+            }
+        }
+
+        [Test]
+        public void AppendText_HasDifferentConnection_AfterDisconnect_WhetherIdleOrPlayingOrWaiting()
+        {
+            foreach (var state in new[] { "再生していない", "再生中で待ちなし", "再生中で待ちあり" })
+            {
+                var sequencer = new SpeechSequencer();
+                sequencer.OnSay(AudioSay(1, turn: 1));
+                if (state == "再生していない")
+                {
+                    sequencer.OnPlaybackFinished(1);
+                }
+                else if (state == "再生中で待ちあり")
+                {
+                    sequencer.OnSay(TextSay(2, turn: 1));
+                    sequencer.OnSay(AudioSay(3, turn: 1));
+                }
+
+                var earlier = Drain(sequencer).OfType<AppendText>().ToList();
+                Assert.That(earlier.Count, Is.EqualTo(1), state + " " + Describe(earlier));
+
+                sequencer.OnDisconnected();
+                Drain(sequencer);
+                sequencer.OnSay(AudioSay(1, turn: 1, text: "新しい頭脳の声"));
+                sequencer.OnSay(TextSay(2, turn: 1, text: "新しい頭脳の文字"));
+                sequencer.OnPlaybackFinished(1);
+                var later = Drain(sequencer).OfType<AppendText>().ToList();
+
+                var because = state + " " + Describe(earlier.Concat(later));
+                Assert.That(later.Select(a => a.Text), Is.EqualTo(new[] { "新しい頭脳の声", "新しい頭脳の文字" }), because + "（切断で捨てた say が出ている）");
+                Assert.That(later[0].Connection, Is.Not.EqualTo(earlier[0].Connection), because);
+                Assert.That(later[1].Connection, Is.EqualTo(later[0].Connection), because);
+            }
+        }
+
+        [Test]
+        public void AppendText_HasConnectionDifferentFromEveryEarlierConnection_WhenDisconnectedRepeatedly()
+        {
+            var sequencer = new SpeechSequencer();
+            var appends = new List<AppendText>();
+
+            appends.Add(AppendOf(sequencer, TextSay(1, turn: 1, text: "1 つ目の接続")));
+            sequencer.OnDisconnected();
+            appends.Add(AppendOf(sequencer, AudioSay(1, turn: 1, text: "2 つ目の接続")));
+            sequencer.OnDisconnected();
+            sequencer.OnDisconnected();
+            Drain(sequencer);
+            appends.Add(AppendOf(sequencer, TextSay(1, turn: 1, text: "4 つ目の接続")));
+            sequencer.OnDisconnected();
+            appends.Add(AppendOf(sequencer, BrokenAudioSay(1, TestJson.Quote(NotWavAudio), turn: 1, text: "5 つ目の接続")));
+            sequencer.OnDisconnected();
+            sequencer.OnDisconnected();
+            sequencer.OnDisconnected();
+            appends.Add(AppendOf(sequencer, TextSay(1, turn: 1, text: "8 つ目の接続")));
+
+            Assert.That(appends.Select(a => a.Connection).Distinct().Count(), Is.EqualTo(appends.Count), Describe(appends));
+        }
+
+        [Test]
+        public void AppendText_KeepsConnection_AcrossCancel()
+        {
+            var sequencer = new SpeechSequencer();
+            var appends = new List<AppendText>();
+
+            appends.Add(AppendOf(sequencer, TextSay(1, turn: 1)));
+            sequencer.OnCancel();
+            appends.Add(AppendOf(sequencer, AudioSay(2, turn: 1)));
+            sequencer.OnCancel();
+            Drain(sequencer);
+            appends.Add(AppendOf(sequencer, AudioSay(3, turn: 1)));
+            sequencer.OnSay(TextSay(4, turn: 1));
+            sequencer.OnCancel();
+            Drain(sequencer);
+            appends.Add(AppendOf(sequencer, BrokenAudioSay(5, TestJson.Quote(NotWavAudio), turn: 1)));
+            sequencer.OnCancel();
+            sequencer.OnCancel();
+            appends.Add(AppendOf(sequencer, TextSay(6, turn: 1)));
+
+            Assert.That(appends.Count, Is.EqualTo(5), Describe(appends));
+            Assert.That(appends.Select(a => a.Connection).Distinct().Count(), Is.EqualTo(1), Describe(appends));
+        }
+
         // ---- 不変条件（ランダムな操作列） ----
 
         [Test]
-        public void Sequencer_KeepsOrderingAndOnceOnlyInvariants_ForRandomOperationSequences()
+        public void Sequencer_KeepsOrderingOnceOnlyAndConnectionInvariants_ForRandomOperationSequences()
         {
             for (var seed = 0; seed < 400; seed++)
             {
@@ -649,6 +820,8 @@ namespace VRMate.Tests
             var lastAppendedId = 0L;
             long? playing = null;
             var nextId = 1L;
+            var disconnects = 0;
+            var connectionAfterDisconnects = new Dictionary<int, long>();
 
             Action<string> check = context =>
             {
@@ -682,6 +855,17 @@ namespace VRMate.Tests
                         Assert.That(append.Turn, Is.GreaterThan(lastAppendedId), because + "（受け取った順と違う）");
                         Assert.That(cancelled.Contains(append.Turn), Is.False, because + "（取り消した say を開始）");
                         Assert.That(append.Text, Is.EqualTo("say " + append.Turn), because);
+                        long connection;
+                        if (connectionAfterDisconnects.TryGetValue(disconnects, out connection))
+                        {
+                            Assert.That(append.Connection, Is.EqualTo(connection), because + "（同じ接続の中で番号が変わった）");
+                        }
+                        else
+                        {
+                            Assert.That(connectionAfterDisconnects.Values, Has.No.Member(append.Connection), because + "（前の接続と同じ番号）");
+                            connectionAfterDisconnects[disconnects] = append.Connection;
+                        }
+
                         lastAppendedId = append.Turn;
                         continue;
                     }
@@ -791,6 +975,7 @@ namespace VRMate.Tests
                     if (disconnect)
                     {
                         sequencer.OnDisconnected();
+                        disconnects++;
                     }
                     else
                     {

@@ -80,6 +80,7 @@ namespace LLMUnitySamples
         private const string notConnectedPlaceholder = "頭脳につながっていません";
         private SpeechPlayer speechPlayer;
         private Bubble currentAiBubble;
+        private long currentAiConnection;
         private long currentAiTurn;
         private bool? placeholderConnected;
 
@@ -152,14 +153,16 @@ namespace LLMUnitySamples
             speechPlayer = null;
         }
 
-        void OnSpeechTextAppended(long turn, string text)
+        void OnSpeechTextAppended(long connection, long turn, string text)
         {
             if (inputBubble == null || string.IsNullOrEmpty(text)) return;
 
             // One AI bubble per turn; a trimmed bubble cannot be appended to, so start a new one.
-            if (currentAiBubble == null || turn != currentAiTurn || !chatBubbles.Contains(currentAiBubble))
+            // VRMate: a restarted brain counts turns from the start again, so the connection is compared too.
+            if (currentAiBubble == null || connection != currentAiConnection || turn != currentAiTurn || !chatBubbles.Contains(currentAiBubble))
             {
                 currentAiBubble = AddBubble(text, false);
+                currentAiConnection = connection;
                 currentAiTurn = turn;
             }
             else

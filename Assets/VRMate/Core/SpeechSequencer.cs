@@ -30,11 +30,15 @@ namespace VRMate
 
     public sealed class AppendText : SpeechAction
     {
-        public AppendText(long turn, string text)
+        public AppendText(long connection, long turn, string text)
         {
+            Connection = connection;
             Turn = turn;
             Text = text;
         }
+
+        /// <summary>Changes on every disconnect; a turn only identifies a reply within one connection.</summary>
+        public long Connection { get; }
 
         public long Turn { get; }
 
@@ -55,6 +59,8 @@ namespace VRMate
     /// Orders says: at most one plays at a time, the rest wait in arrival order up to maxPending.
     /// Every say that is not cancelled gets exactly one "played"; "started" comes after its text is
     /// shown and only for says that actually start. Cancel and disconnect drop everything silently.
+    /// Disconnect also moves to a new connection number: a restarted brain counts turns again from
+    /// the start, so a reply is identified by connection and turn together, never by turn alone.
     /// Not thread-safe; call from one thread.
     /// </summary>
     public sealed class SpeechSequencer
@@ -65,6 +71,7 @@ namespace VRMate
         private readonly Queue<SayMessage> _pending = new Queue<SayMessage>();
         private readonly List<SpeechAction> _actions = new List<SpeechAction>();
         private long? _playingId;
+        private long _connection;
 
         public SpeechSequencer(int maxPending = DefaultMaxPending)
         {
@@ -120,6 +127,7 @@ namespace VRMate
         public void OnDisconnected()
         {
             StopAll();
+            _connection++;
         }
 
         public IReadOnlyList<SpeechAction> DrainActions()
@@ -151,7 +159,7 @@ namespace VRMate
         {
             if (!say.HasAudio)
             {
-                _actions.Add(new AppendText(say.Turn, say.Text));
+                _actions.Add(new AppendText(_connection, say.Turn, say.Text));
                 _actions.Add(new SendMessage(BrainProtocol.Started(say.Id)));
                 _actions.Add(new SendMessage(BrainProtocol.Played(say.Id)));
                 return;
@@ -171,7 +179,7 @@ namespace VRMate
             if (audio == null)
             {
                 // The text is still shown so the speech bubble does not lose a sentence.
-                _actions.Add(new AppendText(say.Turn, say.Text));
+                _actions.Add(new AppendText(_connection, say.Turn, say.Text));
                 _actions.Add(new SendMessage(BrainProtocol.Played(say.Id, string.IsNullOrEmpty(error) ? "audio: unplayable" : error)));
                 return;
             }
@@ -179,7 +187,7 @@ namespace VRMate
             var timeline = say.Visemes != null ? new VisemeTimeline(say.Visemes) : null;
             _playingId = say.Id;
             _actions.Add(new PlayAudio(say.Id, audio, timeline));
-            _actions.Add(new AppendText(say.Turn, say.Text));
+            _actions.Add(new AppendText(_connection, say.Turn, say.Text));
             _actions.Add(new SendMessage(BrainProtocol.Started(say.Id)));
         }
     }
