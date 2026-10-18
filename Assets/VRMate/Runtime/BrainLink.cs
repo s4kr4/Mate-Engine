@@ -12,7 +12,8 @@ namespace VRMate
 
     /// <summary>
     /// Owns the connection to the brain. Socket work happens on background threads inside LinkClient;
-    /// this component drains its events on the main thread and routes them to SpeechPlayer.
+    /// this component drains its events on the main thread and routes them to SpeechPlayer
+    /// (expressions and motions included, so that cancel and disconnect undo them in order).
     /// </summary>
     [DisallowMultipleComponent]
     public class BrainLink : MonoBehaviour
@@ -23,6 +24,7 @@ namespace VRMate
         private const int MaxEventsPerFrame = 16;
         private const int MaxLoggedChars = 200;
 
+        private readonly WarnOnce cueWarnings = new WarnOnce();
         private LinkClient client;
 
         public static BrainLink Instance { get; private set; }
@@ -132,6 +134,11 @@ namespace VRMate
             var say = message as SayMessage;
             if (say != null)
             {
+                foreach (var problem in say.Problems)
+                {
+                    LogCueWarning("[VRMate] dropped a cue from say " + say.Id + " (" + problem + ")", problem);
+                }
+
                 if (SpeechPlayer.Instance != null)
                 {
                     SpeechPlayer.Instance.OnSay(say);
@@ -154,7 +161,36 @@ namespace VRMate
                 return;
             }
 
+            var expression = message as ExpressionMessage;
+            if (expression != null)
+            {
+                if (SpeechPlayer.Instance != null)
+                {
+                    SpeechPlayer.Instance.OnExpression(expression.Name);
+                }
+
+                return;
+            }
+
+            var motion = message as MotionMessage;
+            if (motion != null)
+            {
+                if (SpeechPlayer.Instance != null)
+                {
+                    SpeechPlayer.Instance.OnMotion(motion.Name);
+                }
+
+                return;
+            }
+
             var invalid = message as InvalidMessage;
+            if (invalid != null && invalid.IsCue)
+            {
+                // The brain may repeat a bad name in every reply; the reason names it, so warn once per reason.
+                LogCueWarning("[VRMate] invalid message (" + invalid.Reason + ")", invalid.Reason);
+                return;
+            }
+
             if (invalid != null)
             {
                 Debug.LogWarning("[VRMate] invalid message (" + invalid.Reason + "): " + Shorten(text));
@@ -169,6 +205,15 @@ namespace VRMate
 
             var ignored = message as IgnoredMessage;
             Debug.LogWarning("[VRMate] ignored message (" + (ignored != null ? ignored.Reason : "unknown") + "): " + Shorten(text));
+        }
+
+        /// <summary>Logs only the first time key is seen.</summary>
+        private void LogCueWarning(string message, string key)
+        {
+            if (cueWarnings.ShouldWarn(key))
+            {
+                Debug.LogWarning(message);
+            }
         }
 
         private static string Shorten(string text)

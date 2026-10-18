@@ -19,6 +19,8 @@ namespace VRMate
             var root = new GameObject("VRMate");
             Object.DontDestroyOnLoad(root);
             root.AddComponent<SpeechPlayer>();
+            root.AddComponent<ExpressionPlayer>();
+            root.AddComponent<MotionPlayer>();
             root.AddComponent<BrainLink>();
         }
     }

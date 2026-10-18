@@ -16,7 +16,7 @@ namespace VRMate
     [DisallowMultipleComponent]
     public class SpeechPlayer : MonoBehaviour
     {
-        private const float AvatarSearchInterval = 0.5f;
+        private const float AvatarSearchInterval = AvatarLocator.SearchInterval;
 
         private static readonly int IsTalkingHash = Animator.StringToHash("isTalking");
         private static readonly ExpressionKey KeyAa = ExpressionKey.Aa;
@@ -40,6 +40,12 @@ namespace VRMate
 
         public static SpeechPlayer Instance { get; private set; }
 
+        /// <summary>True while a say's audio plays (the mouth moves); text-only says never set it.</summary>
+        public bool IsTalking
+        {
+            get { return talking; }
+        }
+
         /// <summary>
         /// Raised on the main thread when a say starts (or is shown without audio): connection, turn, text.
         /// Turns restart when the brain reconnects, so one reply is the pair of connection and turn.
@@ -49,6 +55,20 @@ namespace VRMate
         public void OnSay(SayMessage say)
         {
             sequencer.OnSay(say);
+            RunActions();
+        }
+
+        /// <summary>A standalone expression message: shown at once, and undone by cancel and disconnect.</summary>
+        public void OnExpression(string name)
+        {
+            sequencer.OnExpression(name);
+            RunActions();
+        }
+
+        /// <summary>A standalone motion message: played at once, and stopped by cancel and disconnect.</summary>
+        public void OnMotion(string name)
+        {
+            sequencer.OnMotion(name);
             RunActions();
         }
 
@@ -181,6 +201,38 @@ namespace VRMate
                 return;
             }
 
+            var setExpression = action as SetExpression;
+            if (setExpression != null)
+            {
+                if (ExpressionPlayer.Instance != null)
+                {
+                    ExpressionPlayer.Instance.Set(setExpression.Name);
+                }
+
+                return;
+            }
+
+            var playMotion = action as PlayMotion;
+            if (playMotion != null)
+            {
+                if (MotionPlayer.Instance != null)
+                {
+                    MotionPlayer.Instance.Play(playMotion.Name);
+                }
+
+                return;
+            }
+
+            if (action is StopMotion)
+            {
+                if (MotionPlayer.Instance != null)
+                {
+                    MotionPlayer.Instance.Stop();
+                }
+
+                return;
+            }
+
             var send = action as SendMessage;
             if (send != null && BrainLink.Instance != null)
             {
@@ -298,7 +350,7 @@ namespace VRMate
             }
 
             nextAvatarSearchTime = Time.unscaledTime + AvatarSearchInterval;
-            var found = FindAvatarAnimator();
+            var found = AvatarLocator.FindAnimator();
             if (found == avatarAnimator)
             {
                 return;
@@ -320,38 +372,6 @@ namespace VRMate
             {
                 SetTalking(true);
             }
-        }
-
-        // Same search order as ChatBot.FindAvatarSmart.
-        private static Animator FindAvatarAnimator()
-        {
-            Animator found = null;
-            var loader = FindFirstObjectByType<VRMLoader>();
-            if (loader != null)
-            {
-                var current = loader.GetCurrentModel();
-                if (current != null)
-                {
-                    found = current.GetComponentsInChildren<Animator>(true).FirstOrDefault(a => a && a.gameObject.activeInHierarchy);
-                }
-            }
-
-            if (found == null)
-            {
-                var modelParent = GameObject.Find("Model");
-                if (modelParent != null)
-                {
-                    found = modelParent.GetComponentsInChildren<Animator>(true).FirstOrDefault(a => a && a.gameObject.activeInHierarchy);
-                }
-            }
-
-            if (found == null)
-            {
-                var all = FindObjectsByType<Animator>(FindObjectsInactive.Include, FindObjectsSortMode.None);
-                found = all.FirstOrDefault(a => a && a.isActiveAndEnabled);
-            }
-
-            return found;
         }
     }
 }

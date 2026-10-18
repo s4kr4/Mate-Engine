@@ -120,6 +120,21 @@ namespace VRMate.Tests
         }
 
         [Test]
+        public void SayMessage_KeepsEveryField_WhenConstructedWithSixArguments()
+        {
+            var visemes = new List<VisemeKey> { new VisemeKey(0, VisemeShape.Aa), new VisemeKey(0.5, VisemeShape.Sil) };
+
+            var say = new SayMessage(-3, long.MaxValue, "文", true, "UklGRg==", visemes);
+
+            Assert.That(say.Id, Is.EqualTo(-3L));
+            Assert.That(say.Turn, Is.EqualTo(long.MaxValue));
+            Assert.That(say.Text, Is.EqualTo("文"));
+            Assert.That(say.HasAudio, Is.True);
+            Assert.That(say.AudioBase64, Is.EqualTo("UklGRg=="));
+            Assert.That(say.Visemes, Is.SameAs(visemes));
+        }
+
+        [Test]
         public void Parse_IgnoresUnknownFields_WhenSayHasExtraFields()
         {
             var json = "{\"expression\":\"joy\",\"type\":\"say\",\"nested\":{\"type\":\"cancel\",\"id\":\"x\"},"
@@ -450,8 +465,8 @@ namespace VRMate.Tests
             }
         }
 
-        [TestCase("{\"type\":\"expression\",\"name\":\"joy\"}")]
-        [TestCase("{\"type\":\"motion\",\"name\":\"wave\"}")]
+        [TestCase("{\"type\":\"expressions\",\"name\":\"joy\"}")]
+        [TestCase("{\"type\":\"Motion\",\"name\":\"wave\"}")]
         [TestCase("{\"type\":\"input\",\"text\":\"hi\"}")]
         [TestCase("{\"type\":\"played\",\"id\":1}")]
         [TestCase("{\"type\":\"SAY\",\"id\":1,\"turn\":1,\"text\":\"a\"}")]

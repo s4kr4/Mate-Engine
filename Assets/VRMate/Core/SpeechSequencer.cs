@@ -55,12 +55,41 @@ namespace VRMate
         public string Json { get; }
     }
 
+    public sealed class SetExpression : SpeechAction
+    {
+        public SetExpression(string name)
+        {
+            Name = name;
+        }
+
+        /// <summary>Accepted by CueNames.IsExpression; "neutral" gives the face back to upstream.</summary>
+        public string Name { get; }
+    }
+
+    public sealed class PlayMotion : SpeechAction
+    {
+        public PlayMotion(string name)
+        {
+            Name = name;
+        }
+
+        /// <summary>Accepted by CueNames.IsMotion.</summary>
+        public string Name { get; }
+    }
+
+    public sealed class StopMotion : SpeechAction
+    {
+    }
+
     /// <summary>
     /// Orders says: at most one plays at a time, the rest wait in arrival order up to maxPending.
     /// Every say that is not cancelled gets exactly one "played"; "started" comes after its text is
     /// shown and only for says that actually start. Cancel and disconnect drop everything silently.
     /// Disconnect also moves to a new connection number: a restarted brain counts turns again from
     /// the start, so a reply is identified by connection and turn together, never by turn alone.
+    /// A say's expression and motion are shown when the say starts, right before its text; standalone
+    /// ones at once. Cancel and disconnect undo only what was actually shown: the expression (unless
+    /// neutral came after it) and the motion (unless stopped since).
     /// Not thread-safe; call from one thread.
     /// </summary>
     public sealed class SpeechSequencer
@@ -72,6 +101,8 @@ namespace VRMate
         private readonly List<SpeechAction> _actions = new List<SpeechAction>();
         private long? _playingId;
         private long _connection;
+        private bool _expressionShown;
+        private bool _motionShown;
 
         public SpeechSequencer(int maxPending = DefaultMaxPending)
         {
@@ -119,6 +150,24 @@ namespace VRMate
             RunPending();
         }
 
+        /// <summary>Shown at once, without touching the says; names CueNames.IsExpression refuses are ignored.</summary>
+        public void OnExpression(string name)
+        {
+            if (CueNames.IsExpression(name))
+            {
+                ShowExpression(name);
+            }
+        }
+
+        /// <summary>Played at once, without touching the says; names CueNames.IsMotion refuses are ignored.</summary>
+        public void OnMotion(string name)
+        {
+            if (CueNames.IsMotion(name))
+            {
+                ShowMotion(name);
+            }
+        }
+
         public void OnCancel()
         {
             StopAll();
@@ -145,6 +194,35 @@ namespace VRMate
                 _playingId = null;
                 _actions.Add(new StopAudio());
             }
+
+            if (_expressionShown)
+            {
+                ShowExpression(CueNames.Neutral);
+            }
+
+            if (_motionShown)
+            {
+                _motionShown = false;
+                _actions.Add(new StopMotion());
+            }
+        }
+
+        private void ShowCues(SayMessage say)
+        {
+            OnExpression(say.Expression);
+            OnMotion(say.Motion);
+        }
+
+        private void ShowExpression(string name)
+        {
+            _expressionShown = name != CueNames.Neutral;
+            _actions.Add(new SetExpression(name));
+        }
+
+        private void ShowMotion(string name)
+        {
+            _motionShown = true;
+            _actions.Add(new PlayMotion(name));
         }
 
         private void RunPending()
@@ -159,6 +237,7 @@ namespace VRMate
         {
             if (!say.HasAudio)
             {
+                ShowCues(say);
                 _actions.Add(new AppendText(_connection, say.Turn, say.Text));
                 _actions.Add(new SendMessage(BrainProtocol.Started(say.Id)));
                 _actions.Add(new SendMessage(BrainProtocol.Played(say.Id)));
@@ -178,7 +257,8 @@ namespace VRMate
 
             if (audio == null)
             {
-                // The text is still shown so the speech bubble does not lose a sentence.
+                // The text (and its cues) is still shown so the speech bubble does not lose a sentence.
+                ShowCues(say);
                 _actions.Add(new AppendText(_connection, say.Turn, say.Text));
                 _actions.Add(new SendMessage(BrainProtocol.Played(say.Id, string.IsNullOrEmpty(error) ? "audio: unplayable" : error)));
                 return;
@@ -187,6 +267,7 @@ namespace VRMate
             var timeline = say.Visemes != null ? new VisemeTimeline(say.Visemes) : null;
             _playingId = say.Id;
             _actions.Add(new PlayAudio(say.Id, audio, timeline));
+            ShowCues(say);
             _actions.Add(new AppendText(_connection, say.Turn, say.Text));
             _actions.Add(new SendMessage(BrainProtocol.Started(say.Id)));
         }

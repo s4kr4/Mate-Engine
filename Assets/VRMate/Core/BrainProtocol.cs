@@ -143,6 +143,10 @@ namespace VRMate
                     return InterpretSay(obj);
                 case "cancel":
                     return new CancelMessage();
+                case "expression":
+                    return InterpretCueMessage(obj, CueKind.Expression);
+                case "motion":
+                    return InterpretCueMessage(obj, CueKind.Motion);
                 default:
                     return new IgnoredMessage("unknown type '" + Shorten(type) + "'");
             }
@@ -184,7 +188,84 @@ namespace VRMate
             JToken visemesToken;
             obj.TryGetValue("visemes", out visemesToken);
 
-            return new SayMessage(id, turn, (string)textToken, hasAudio, audio, ReadVisemes(visemesToken));
+            // An unusable cue is dropped on its own; the sentence is still spoken and shown.
+            var problems = new List<string>(2);
+            var expression = ReadSayCue(obj, CueKind.Expression, problems);
+            var motion = ReadSayCue(obj, CueKind.Motion, problems);
+
+            return new SayMessage(id, turn, (string)textToken, hasAudio, audio, ReadVisemes(visemesToken), expression, motion, problems);
+        }
+
+        private enum CueKind
+        {
+            Expression,
+            Motion,
+        }
+
+        /// <summary>Absent and null both mean "no cue" in a say.</summary>
+        private static string ReadSayCue(JObject obj, CueKind kind, List<string> problems)
+        {
+            var key = kind == CueKind.Expression ? "expression" : "motion";
+            JToken token;
+            if (!obj.TryGetValue(key, out token) || token.Type == JTokenType.Null)
+            {
+                return null;
+            }
+
+            string name;
+            string problem;
+            if (!TryReadCueName(token, kind, "say: " + key, out name, out problem))
+            {
+                problems.Add(problem);
+                return null;
+            }
+
+            return name;
+        }
+
+        private static BrainMessage InterpretCueMessage(JObject obj, CueKind kind)
+        {
+            var where = kind == CueKind.Expression ? "expression: name" : "motion: name";
+            JToken token;
+            if (!obj.TryGetValue("name", out token) || token.Type == JTokenType.Null)
+            {
+                return new InvalidMessage(null, where + " is missing", isCue: true);
+            }
+
+            string name;
+            string problem;
+            if (!TryReadCueName(token, kind, where, out name, out problem))
+            {
+                return new InvalidMessage(null, problem, isCue: true);
+            }
+
+            return kind == CueKind.Expression ? (BrainMessage)new ExpressionMessage(name) : new MotionMessage(name);
+        }
+
+        /// <summary>
+        /// The problem names the kind and holds at most ReasonValueLength characters of the value, and
+        /// only the JSON type of a non-string (never its text), so its length is bounded whatever the input.
+        /// </summary>
+        private static bool TryReadCueName(JToken token, CueKind kind, string where, out string name, out string problem)
+        {
+            name = null;
+            problem = null;
+            if (token.Type != JTokenType.String)
+            {
+                problem = where + " is not a string (" + token.Type + ")";
+                return false;
+            }
+
+            var value = (string)token;
+            if (kind == CueKind.Expression ? !CueNames.IsExpression(value) : !CueNames.IsMotion(value))
+            {
+                var expected = kind == CueKind.Expression ? " is not a known expression '" : " is not a well-formed motion name '";
+                problem = where + expected + Shorten(value) + "'";
+                return false;
+            }
+
+            name = value;
+            return true;
         }
 
         /// <summary>Returns null unless every key is well-formed and times strictly increase from a finite non-negative start.</summary>
