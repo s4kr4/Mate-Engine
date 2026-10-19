@@ -1,10 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
-using UniGLTF;
-using UniVRM10;
 using UnityEngine;
 
 namespace VRMate
@@ -22,11 +18,11 @@ namespace VRMate
     [DisallowMultipleComponent]
     public class MotionPlayer : MonoBehaviour
     {
-        private const string IdleState = "Idle";
-
         // Names that open the same file share one entry; otherwise every letter case would load it again.
-        private readonly Dictionary<string, LoadedMotion> loaded = new Dictionary<string, LoadedMotion>(MotionFiles.NameComparer);
-        private readonly List<LoadedMotion> motions = new List<LoadedMotion>();
+        private readonly Dictionary<string, VrmaClip> loaded = new Dictionary<string, VrmaClip>(MotionFiles.NameComparer);
+
+        // Index is the MotionFade token.
+        private readonly List<VrmaClip> motions = new List<VrmaClip>();
         private readonly HashSet<string> loading = new HashSet<string>(MotionFiles.NameComparer);
         private readonly WarnOnce warnings = new WarnOnce();
         private readonly AvatarWatch avatar = new AvatarWatch();
@@ -63,7 +59,7 @@ namespace VRMate
                 return;
             }
 
-            LoadedMotion motion;
+            VrmaClip motion;
             if (loaded.TryGetValue(name, out motion))
             {
                 if (CanPlay())
@@ -148,53 +144,30 @@ namespace VRMate
             loaded.Clear();
         }
 
-        private void ApplyPose(LoadedMotion motion, float time, float weight)
+        private void ApplyPose(VrmaClip motion, float time, float weight)
         {
-            motion.Clip.SampleAnimation(motion.Root, Mathf.Min(time, motion.Clip.length));
-            motion.Pose.GetHumanPose(ref sourcePose);
-            avatarPose.GetHumanPose(ref targetPose);
-
-            var muscles = targetPose.muscles;
-            var source = sourcePose.muscles;
-            var count = Math.Min(muscles.Length, source.Length);
-            for (var i = 0; i < count; i++)
-            {
-                muscles[i] = Mathf.Lerp(muscles[i], source[i], weight);
-            }
-
-            targetPose.muscles = muscles;
-            targetPose.bodyRotation = Quaternion.Slerp(targetPose.bodyRotation, sourcePose.bodyRotation, weight);
-            targetPose.bodyPosition = Vector3.Lerp(targetPose.bodyPosition, sourcePose.bodyPosition, weight);
-            avatarPose.SetHumanPose(ref targetPose);
+            VrmaClipLoader.ApplyPose(avatarPose, motion, time, weight, ref targetPose, ref sourcePose);
         }
 
         private bool CanPlay()
         {
-            if (avatarPose == null || avatarAnimator == null || !avatarAnimator.isActiveAndEnabled)
+            if (avatarPose == null)
             {
                 return false;
             }
 
-            try
+            string error;
+            if (AvatarState.IsIdle(avatarAnimator, out error))
             {
-                if (avatarAnimator.runtimeAnimatorController == null || avatarAnimator.layerCount == 0)
-                {
-                    return false;
-                }
-
-                // Idle only: dragging, sitting, dancing and sleeping keep the body to upstream.
-                if (!avatarAnimator.GetCurrentAnimatorStateInfo(0).IsName(IdleState))
-                {
-                    return false;
-                }
-
-                return !avatarAnimator.IsInTransition(0) || avatarAnimator.GetNextAnimatorStateInfo(0).IsName(IdleState);
+                return true;
             }
-            catch (Exception e)
+
+            if (error != null)
             {
-                Warn("idle", "cannot read the avatar's animator state: " + e.Message);
-                return false;
+                Warn("idle", "cannot read the avatar's animator state: " + error);
             }
+
+            return false;
         }
 
         private void SetAvatar(Animator found)
@@ -205,7 +178,7 @@ namespace VRMate
             DisposeAvatarPose();
             avatarAnimator = null;
 
-            if (found == null || found.avatar == null || !found.avatar.isHuman || found.GetComponentInChildren<Vrm10Instance>() == null)
+            if (!AvatarState.IsVrm10Humanoid(found))
             {
                 return;
             }
@@ -234,39 +207,13 @@ namespace VRMate
         // async void: nothing awaits the load; every failure is caught and reported here.
         private async void Load(string name, string path)
         {
-            LoadedMotion motion = null;
+            VrmaClip motion = null;
             string error = null;
             try
             {
-                // Reading up to 16 MiB stays off the main thread so a say that starts now does not stutter.
-                var read = await Task.Run(() => ReadFile(path));
-                if (this == null)
-                {
-                    return;
-                }
-
-                if (read.Data == null)
-                {
-                    error = read.Error;
-                }
-                else
-                {
-                    motion = await Import(name, path, read.Data);
-                    if (this == null)
-                    {
-                        if (motion != null)
-                        {
-                            motion.Dispose();
-                        }
-
-                        return;
-                    }
-
-                    if (motion == null)
-                    {
-                        error = "no humanoid animation clip";
-                    }
-                }
+                var result = await VrmaClipLoader.LoadAsync(this, name, path, "VRMate motion " + name);
+                motion = result.Clip;
+                error = result.Error;
             }
             catch (Exception e)
             {
@@ -318,159 +265,11 @@ namespace VRMate
             return requested != null && MotionFiles.NameComparer.Equals(requested, name);
         }
 
-        private static ReadResult ReadFile(string path)
-        {
-            byte[] data;
-            string error;
-            return MotionFiles.TryRead(path, MotionFiles.MaxBytes, out data, out error) ? new ReadResult(data, null) : new ReadResult(null, error);
-        }
-
-        /// <summary>Main thread only. Null (with nothing left behind) when the file has no usable humanoid clip.</summary>
-        private async Task<LoadedMotion> Import(string name, string path, byte[] bytes)
-        {
-            RuntimeGltfInstance instance;
-            using (var data = new GlbBinaryParser(bytes, path).Parse())
-            using (var importer = new Importer(data))
-            {
-                try
-                {
-                    // The synchronous Load() held the main thread for about 220 ms in the trial.
-                    instance = await importer.LoadAsync(new RuntimeOnlyAwaitCaller());
-                }
-                catch (Exception)
-                {
-                    // A failed load can leave its half-built hierarchy in the scene, and a broken file is
-                    // read again on every request; destroying the root removes its GameObjects. Objects
-                    // made before ownership passes to the instance can still remain: the Avatar that
-                    // OnLoadHierarchy creates is left behind when a later step (an expression channel) fails.
-                    if (importer.PartialRoot != null)
-                    {
-                        Destroy(importer.PartialRoot);
-                    }
-
-                    throw;
-                }
-            }
-
-            if (instance == null)
-            {
-                return null;
-            }
-
-            try
-            {
-                var root = instance.Root;
-                root.name = "VRMate motion " + name;
-                root.transform.SetParent(transform, false);
-
-                var animationInstance = root.GetComponent<Vrm10AnimationInstance>();
-                if (animationInstance != null && animationInstance.BoxMan != null)
-                {
-                    animationInstance.ShowBoxMan(false);
-                }
-
-                AnimationClip clip = null;
-                var animation = root.GetComponent<Animation>();
-                if (animation != null)
-                {
-                    clip = animation.clip != null ? animation.clip : animation.Cast<AnimationState>().Select(s => s.clip).FirstOrDefault(c => c != null);
-                    animation.Stop();
-                    animation.enabled = false;
-                }
-
-                // Only its Avatar is used; an enabled Animator would also be found as "the avatar".
-                var animator = root.GetComponent<Animator>();
-                if (animator != null)
-                {
-                    animator.enabled = false;
-                }
-
-                if (clip == null || !(clip.length > 0f) || float.IsInfinity(clip.length) || animator == null || animator.avatar == null || !animator.avatar.isHuman)
-                {
-                    instance.Dispose();
-                    return null;
-                }
-
-                return new LoadedMotion(name, instance, clip, new HumanPoseHandler(animator.avatar, root.transform));
-            }
-            catch (Exception)
-            {
-                instance.Dispose();
-                throw;
-            }
-        }
-
         private void Warn(string key, string message)
         {
             if (warnings.ShouldWarn(key))
             {
                 Debug.LogWarning("[VRMate] " + message);
-            }
-        }
-
-        /// <summary>Exposes the root the importer creates, which is otherwise only reachable once loading succeeds.</summary>
-        private sealed class Importer : VrmAnimationImporter
-        {
-            public Importer(GltfData data)
-                : base(data)
-            {
-            }
-
-            public GameObject PartialRoot
-            {
-                get { return Root; }
-            }
-        }
-
-        private struct ReadResult
-        {
-            public ReadResult(byte[] data, string error)
-            {
-                Data = data;
-                Error = error;
-            }
-
-            public byte[] Data { get; }
-
-            public string Error { get; }
-        }
-
-        private sealed class LoadedMotion
-        {
-            private readonly RuntimeGltfInstance instance;
-
-            public LoadedMotion(string name, RuntimeGltfInstance instance, AnimationClip clip, HumanPoseHandler pose)
-            {
-                Name = name;
-                this.instance = instance;
-                Root = instance.Root;
-                Clip = clip;
-                Pose = pose;
-            }
-
-            public string Name { get; }
-
-            public GameObject Root { get; }
-
-            public AnimationClip Clip { get; }
-
-            public HumanPoseHandler Pose { get; private set; }
-
-            /// <summary>Index in MotionPlayer.motions; used as the MotionFade token.</summary>
-            public int Token { get; set; }
-
-            public void Dispose()
-            {
-                if (Pose != null)
-                {
-                    Pose.Dispose();
-                    Pose = null;
-                }
-
-                if (instance != null)
-                {
-                    instance.Dispose();
-                }
             }
         }
     }

@@ -20,6 +20,7 @@ namespace VRMate
             Object.DontDestroyOnLoad(root);
             root.AddComponent<SpeechPlayer>();
             root.AddComponent<ExpressionPlayer>();
+            root.AddComponent<IdlePlayer>();
             root.AddComponent<MotionPlayer>();
             root.AddComponent<BrainLink>();
         }

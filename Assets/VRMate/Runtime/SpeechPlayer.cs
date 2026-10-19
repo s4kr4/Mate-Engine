@@ -76,12 +76,14 @@ namespace VRMate
         {
             sequencer.OnCancel();
             RunActions();
+            EndIdleTalking();
         }
 
         public void OnDisconnected()
         {
             sequencer.OnDisconnected();
             RunActions();
+            EndIdleTalking();
         }
 
         private void Awake()
@@ -237,6 +239,18 @@ namespace VRMate
             if (send != null && BrainLink.Instance != null)
             {
                 BrainLink.Instance.TrySend(send.Json);
+            }
+        }
+
+        /// <summary>
+        /// IsTalking alone would keep the talk idle for its hold after a cancel or disconnect; nothing more
+        /// will be said in that turn, so the body goes back to the normal idle at once.
+        /// </summary>
+        private static void EndIdleTalking()
+        {
+            if (IdlePlayer.Instance != null)
+            {
+                IdlePlayer.Instance.EndTalking();
             }
         }
 
