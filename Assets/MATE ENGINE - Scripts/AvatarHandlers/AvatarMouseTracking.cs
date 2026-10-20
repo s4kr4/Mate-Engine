@@ -56,8 +56,10 @@ public class AvatarMouseTracking : MonoBehaviour
         headDriver = new GameObject("HeadDriver").transform;
         headDriver.SetParent(headBone.parent, false);
         headDriver.localPosition = headBone.localPosition;
-        headDriver.localRotation = headBone.localRotation;
-        headInitRot = headBone.localRotation;
+        // The driver converges to an absolute target, so measure the offset from identity;
+        // using the Start pose would add its inverse to the animated pose every frame.
+        headDriver.localRotation = Quaternion.identity;
+        headInitRot = Quaternion.identity;
     }
 
     void InitSpine()
@@ -69,8 +71,8 @@ public class AvatarMouseTracking : MonoBehaviour
         spineDriver = new GameObject("SpineDriver").transform;
         spineDriver.SetParent(spineBone.parent, false);
         spineDriver.localPosition = spineBone.localPosition;
-        spineDriver.localRotation = spineBone.localRotation;
-        spineInitRot = spineBone.localRotation;
+        spineDriver.localRotation = Quaternion.identity;
+        spineInitRot = Quaternion.identity;
     }
 
     void InitEye()
