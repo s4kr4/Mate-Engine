@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using NUnit.Framework;
 
 namespace VRMate.Tests
@@ -39,7 +41,7 @@ namespace VRMate.Tests
             return new[] { new IdleClip(A, 4f), new IdleClip(B, 5f), new IdleClip(C, 6f) };
         }
 
-        // 話す間用は 0 番目の T だけを使う。T の混ぜの開始点は 5 秒
+        // 話す間用は 0 番目の T だけを使う（名前がどちらも null で同じなので、一覧で先の T）。T の混ぜの開始点は 5 秒
         private static IdleClip[] Talk2()
         {
             return new[] { new IdleClip(T, 6f), new IdleClip(U, 2f) };
@@ -164,6 +166,10 @@ namespace VRMate.Tests
             public double Elapsed;
             public bool Talking;
             public bool Idle = true;
+
+            /// <summary>Step のたびに、その層と頭打ち後の delta で呼ぶ（null なら呼ばない）。</summary>
+            public Action<Snapshot, float> AfterStep;
+
             private Snapshot _previous;
 
             public Driver()
@@ -210,6 +216,11 @@ namespace VRMate.Tests
                 AssertBounded(now, Lengths, because);
                 AssertContinuous(_previous, now, Clamped(delta), because);
                 _previous = now;
+                if (AfterStep != null)
+                {
+                    AfterStep(now, Clamped(delta));
+                }
+
                 return now;
             }
 
@@ -1640,6 +1651,1561 @@ namespace VRMate.Tests
 
             Assert.That(now.Of(B) - hurried.Of(B), Is.EqualTo(0.2f).Within(Tolerance), "話し終えたら 1 秒の速さに戻る " + now);
             Assert.That(snapshots.Any(s => s.Has(T)), Is.False, "T へは移らない");
+        }
+
+        // ---- 話し始めの話す間用のクリップ ----
+
+        private const long Rest = 40;
+
+        /// <summary>通常の一覧は 4 秒の Rest 1 本だけ。Rest は Time 3 秒で自分自身へ混ぜ、そのたびに最初に戻る（保留の一覧はそこで入れ替わる）。</summary>
+        private static IdleClip[] RestOnly()
+        {
+            return new[] { new IdleClip(Rest, 4f) };
+        }
+
+        /// <summary>負の Token は乱数で作る通常のクリップ。</summary>
+        private static bool IsNormalToken(long token)
+        {
+            return token < 0 || token == A || token == B || token == C || token == Rest;
+        }
+
+        private static IdleClip Talk(long token, string name, float length = 6f)
+        {
+            return new IdleClip(token, length, name);
+        }
+
+        /// <summary>長さ 6 秒の話す間用の一覧。Token は first から一覧の順に 1 ずつ振る。</summary>
+        private static IdleClip[] Named(long first, params string[] names)
+        {
+            var clips = new IdleClip[names.Length];
+            for (var i = 0; i < names.Length; i++)
+            {
+                clips[i] = Talk(first + i, names[i]);
+            }
+
+            return clips;
+        }
+
+        private static string ShowName(string name)
+        {
+            return name == null ? "null" : "\"" + name + "\"";
+        }
+
+        private static string ShowClips(IEnumerable<IdleClip> clips)
+        {
+            return "[" + string.Join(", ", clips.Select(c => c.Token + ":" + ShowName(c.Name) + (c.Length > 0f && !float.IsInfinity(c.Length) ? "" : "（長さ " + c.Length + "）"))) + "]";
+        }
+
+        /// <summary>
+        /// 話し始めに使う話す間用のクリップ: 有効なもの（長さが正で有限）のうち、名前が前回の話し始めの名前より IdleFiles.NameOrder で
+        /// 大きいものの中で最小のもの。そのようなものがないか、まだ話し始めていなければ名前が最小のもの。同じ名前が複数なら一覧で先のもの。
+        /// 有効なものがなければ null。
+        /// </summary>
+        private static IdleClip? ExpectedTalkStart(IdleClip[] talk, bool startedBefore, string previous)
+        {
+            IdleClip? smallest = null;
+            IdleClip? next = null;
+            foreach (var clip in talk)
+            {
+                if (!(clip.Length > 0f) || float.IsInfinity(clip.Length))
+                {
+                    continue;
+                }
+
+                if (smallest == null || IdleFiles.NameOrder.Compare(clip.Name, smallest.Value.Name) < 0)
+                {
+                    smallest = clip;
+                }
+
+                if (startedBefore && IdleFiles.NameOrder.Compare(clip.Name, previous) > 0 && (next == null || IdleFiles.NameOrder.Compare(clip.Name, next.Value.Name) < 0))
+                {
+                    next = clip;
+                }
+            }
+
+            return next ?? smallest;
+        }
+
+        /// <summary>
+        /// 通常のクリップだけが見えている状態から話し始め、1.2 秒（通常のクリップ同士の混ぜの途中でも、それを終えて話す間用へ移り終える長さ）進める。
+        /// 話す間用のクリップだけになったらその Token を、話す間用のクリップが一度も見えなければ null を返す。
+        /// </summary>
+        private static long? StartTalking(Driver driver)
+        {
+            var before = driver.Now;
+            Assert.That(before.Tokens.All(IsNormalToken), Is.True, "前提: 通常のクリップだけ " + before);
+
+            driver.Talking = true;
+            var snapshots = driver.Run(1.2f);
+
+            var talkTokens = snapshots.SelectMany(s => s.Tokens).Where(t => !IsNormalToken(t)).Distinct().ToList();
+            Assert.That(talkTokens.Count, Is.LessThanOrEqualTo(1), "話し始めてから移り終えるまでに話す間用のクリップが替わった: " + string.Join(",", talkTokens));
+            if (talkTokens.Count == 0)
+            {
+                return null;
+            }
+
+            var now = snapshots.Last();
+            AssertTokens(now, new[] { talkTokens[0] }, "話す間用のクリップへ移り終えた");
+            return talkTokens[0];
+        }
+
+        private static long TalkClipAtStart(Driver driver)
+        {
+            var token = StartTalking(driver);
+            Assert.That(token.HasValue, Is.True, "話す間用のクリップへ移らない " + driver.Now);
+            return token.Value;
+        }
+
+        /// <summary>
+        /// 話し終え（EndTalking か、保持が切れるまで待つ）、通常のクリップだけに戻るまで進める。話す間用が自分自身へ混ぜている途中なら
+        /// それを終えてから戻るので、待つのは 2.5 秒（その混ぜの 1 秒 + 戻りの 1 秒 + 余裕）まで。
+        /// </summary>
+        private static void StopTalking(Driver driver, bool viaEndTalking)
+        {
+            if (viaEndTalking)
+            {
+                driver.EndTalking();
+            }
+            else
+            {
+                driver.Talking = false;
+                driver.Run(IdleSequence.TalkHoldSeconds + 0.05f);
+            }
+
+            var back = driver.Step(Frame);
+            for (var waited = Frame; waited < 2.5f && !(back.Count > 0 && back.Tokens.All(IsNormalToken)); waited += Frame)
+            {
+                back = driver.Step(Frame);
+            }
+
+            Assert.That(back.Count, Is.GreaterThan(0), "前提: 自作の待機が見えている " + back);
+            Assert.That(back.Tokens.All(IsNormalToken), Is.True, "前提: 通常のクリップだけに戻った " + back);
+        }
+
+        /// <summary>話し始めと話し終えを count 回繰り返し、話し始めごとに移った話す間用のクリップの Token を返す。</summary>
+        private static List<long> TalkStarts(Driver driver, int count, bool viaEndTalking = true)
+        {
+            var tokens = new List<long>();
+            for (var i = 0; i < count; i++)
+            {
+                tokens.Add(TalkClipAtStart(driver));
+                StopTalking(driver, viaEndTalking);
+            }
+
+            return tokens;
+        }
+
+        /// <summary>
+        /// 話していない間に話す間用の一覧を読み直し（通常の一覧は RestOnly のまま）、最初に戻って入れ替わるまで進める。
+        /// Rest は 1 本だけなので、最初に戻るたびに読み直しの要求が立つ。
+        /// </summary>
+        private static void Reload(Driver driver, IdleClip[] before, IdleClip[] after)
+        {
+            driver.Sequence.TakeReloadRequest();
+            driver.SetClips(RestOnly(), after);
+            var now = driver.Run(3.5f).Last();
+
+            Assert.That(driver.Sequence.TakeReloadRequest(), Is.True, "前提: 最初に戻って一覧が入れ替わった");
+            foreach (var clip in before.Where(b => after.All(a => a.Token != b.Token)))
+            {
+                Assert.That(driver.Sequence.IsInUse(clip.Token), Is.False, "前提: 前の話す間用の一覧はもう使っていない（Token " + clip.Token + "）");
+            }
+
+            Assert.That(now.Tokens.All(IsNormalToken), Is.True, "前提: 通常のクリップだけ " + now);
+        }
+
+        /// <summary>tr-TR が実際に i / I をトルコ語の規則で扱うときだけ、その文化で動かす。扱わない環境では SKIP。</summary>
+        private static void WithTurkishCulture(Action action)
+        {
+            CultureInfo turkish;
+            try
+            {
+                turkish = new CultureInfo("tr-TR");
+            }
+            catch (CultureNotFoundException)
+            {
+                Assert.Ignore("tr-TR が無い環境");
+                return;
+            }
+
+            if (turkish.TextInfo.ToUpper('i') != (char)0x0130 || string.Compare("i", "I", turkish, CompareOptions.IgnoreCase) == 0)
+            {
+                Assert.Ignore("tr-TR がトルコ語の大文字・小文字の規則で動かない環境");
+            }
+
+            var thread = Thread.CurrentThread;
+            var culture = thread.CurrentCulture;
+            var uiCulture = thread.CurrentUICulture;
+            try
+            {
+                thread.CurrentCulture = turkish;
+                thread.CurrentUICulture = turkish;
+                action();
+            }
+            finally
+            {
+                thread.CurrentCulture = culture;
+                thread.CurrentUICulture = uiCulture;
+            }
+        }
+
+        [Test]
+        public void IdleClip_KeepsTokenLengthAndName()
+        {
+            var clip = new IdleClip(long.MinValue, 0.25f, "Idle_Talk-01");
+            var unnamed = new IdleClip(7, 1f, null);
+
+            Assert.That(clip.Token, Is.EqualTo(long.MinValue));
+            Assert.That(clip.Length, Is.EqualTo(0.25f));
+            Assert.That(clip.Name, Is.EqualTo("Idle_Talk-01"), "綴りのまま");
+            Assert.That(unnamed.Name, Is.Null, "名前は null でもよい");
+        }
+
+        [Test]
+        public void IdleClip_HasNoName_WhenMadeFromTokenAndLength()
+        {
+            Assert.That(new IdleClip(7, 1f).Name, Is.Null);
+            Assert.That(default(IdleClip).Name, Is.Null);
+        }
+
+        [Test]
+        public void Advance_StartsWithTheTalkClipWhoseNameIsSmallest_WhenTalkingStartsForTheFirstTime()
+        {
+            var talk = Named(100, "idle_c", "idle_a", "idle_b");
+            Assert.That(IdleFiles.NameOrder.Compare("idle_a", "idle_b"), Is.LessThan(0), "前提");
+            Assert.That(IdleFiles.NameOrder.Compare("idle_a", "idle_c"), Is.LessThan(0), "前提");
+            var driver = Started(RestOnly(), talk);
+
+            var token = TalkClipAtStart(driver);
+
+            Assert.That(token, Is.EqualTo(101L), "一覧の順ではなく名前が最小の idle_a " + ShowClips(talk));
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void Advance_MovesToTheTalkClipWithTheNextNameAndWrapsToTheSmallest_EachTimeTalkingStartsAgain(bool viaEndTalking)
+        {
+            // 一覧の順は b, c, a。名前の順は a(102), b(100), c(101)
+            var talk = Named(100, "idle_b", "idle_c", "idle_a");
+            var driver = Started(RestOnly(), talk);
+
+            var starts = TalkStarts(driver, 7, viaEndTalking);
+
+            Assert.That(starts, Is.EqualTo(new[] { 102L, 100L, 101L, 102L, 100L, 101L, 102L }), "話し終え方 " + (viaEndTalking ? "EndTalking" : "保持が切れる") + ": " + string.Join(",", starts));
+        }
+
+        [Test]
+        public void Advance_UsesTheOnlyValidTalkClipEveryTime_WhenTheTalkListHasOneValidClip()
+        {
+            var talk = Clips(Talk(100, "idle_a", 0f), Talk(101, "idle_b"), Talk(102, "idle_c", float.NaN));
+            var driver = Started(RestOnly(), talk);
+
+            var starts = TalkStarts(driver, 4);
+
+            Assert.That(starts, Is.EqualTo(new[] { 101L, 101L, 101L, 101L }), "有効なのは idle_b だけ: " + string.Join(",", starts));
+        }
+
+        [Test]
+        public void Advance_SkipsTalkClipsWhoseLengthIsNotPositiveFinite_WhenChoosingTheNextName()
+        {
+            var talk = Clips(Talk(100, "idle_a"), Talk(101, "idle_b", 0f), Talk(102, "idle_c"), Talk(103, "idle_d", float.PositiveInfinity), Talk(104, "idle_e", -1f));
+            var driver = Started(RestOnly(), talk);
+
+            var starts = TalkStarts(driver, 4);
+
+            Assert.That(starts, Is.EqualTo(new[] { 100L, 102L, 100L, 102L }), "長さが正で有限でないものは除いてから選ぶ " + ShowClips(talk) + ": " + string.Join(",", starts));
+        }
+
+        [Test]
+        public void Advance_UsesTheEarlierOfTalkClipsWithTheSameName_IgnoringLetterCase()
+        {
+            // idle_a は 101 と 104、idle_b は 100・102・103 が同じ名前。それぞれ一覧で先のものだけを使う
+            var talk = Clips(Talk(100, "idle_b"), Talk(101, "idle_a"), Talk(102, "IDLE_B"), Talk(103, "idle_b"), Talk(104, "Idle_A"));
+            var driver = Started(RestOnly(), talk);
+
+            var starts = TalkStarts(driver, 4);
+
+            Assert.That(starts, Is.EqualTo(new[] { 101L, 100L, 101L, 100L }), ShowClips(talk) + ": " + string.Join(",", starts));
+        }
+
+        [Test]
+        public void Advance_GoesThroughNullAndEmptyNamesInTheComparerOrder()
+        {
+            var talk = Named(100, "idle_a", "", null);
+            Assert.That(IdleFiles.NameOrder.Compare(null, ""), Is.LessThan(0), "前提: null は空の名前より前");
+            Assert.That(IdleFiles.NameOrder.Compare("", "idle_a"), Is.LessThan(0), "前提");
+            var driver = Started(RestOnly(), talk);
+
+            var starts = TalkStarts(driver, 5);
+
+            Assert.That(starts, Is.EqualTo(new[] { 102L, 101L, 100L, 102L, 101L }), "null、空、idle_a の順で、最後の次は最初: " + string.Join(",", starts));
+        }
+
+        [Test]
+        public void Advance_UsesTheFirstTalkClipEveryTime_WhenAllTalkClipsHaveTheSameName()
+        {
+            foreach (var talk in new[] { Talk2(), Clips(Talk(100, "idle_x"), Talk(101, "IDLE_X")) })
+            {
+                var driver = Started(RestOnly(), talk);
+
+                var starts = TalkStarts(driver, 4);
+
+                var first = talk[0].Token;
+                Assert.That(starts, Is.EqualTo(new[] { first, first, first, first }), "名前がどれも同じ（どれも null を含む）なら一覧で先のもの " + ShowClips(talk) + ": " + string.Join(",", starts));
+            }
+        }
+
+        [Test]
+        public void Advance_LoopsTheTalkClipChosenAtTheStartIntoItself_AndDoesNotMoveToTheNextNameWhileTalking()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 1), Is.EqualTo(new[] { 100L }), "前提");
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(101L), "前提: 2 回目の話し始めは idle_b");
+
+            var talking = driver.Run(12f);
+
+            Assert.That(talking.All(s => s.Tokens.All(t => t == 101L)), Is.True, "話している間は idle_b だけ " + talking.FirstOrDefault(s => s.Tokens.Any(t => t != 101L)));
+            Assert.That(talking.Any(s => s.Count == 2), Is.True, "前提: idle_b から idle_b へ混ぜた");
+            StopTalking(driver, true);
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(102L), "繰り返しは話し始めではないので次は idle_c");
+        }
+
+        [Test]
+        public void Advance_KeepsTheTalkClip_WhenTheNextSentenceStartsWithinTheHold()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 1), Is.EqualTo(new[] { 100L }), "前提");
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(101L), "前提: 2 回目の話し始めは idle_b");
+
+            // 次の文は 2 回（名前は 3 つなので、次の文ごとに進むと次の話し始めが idle_c にならない）
+            var snapshots = new List<Snapshot>();
+            for (var sentence = 0; sentence < 2; sentence++)
+            {
+                driver.Talking = false;
+                snapshots.AddRange(driver.Run(1f));
+                driver.Talking = true;
+                snapshots.AddRange(driver.Run(1f));
+            }
+
+            Assert.That(snapshots.All(s => s.Tokens.All(t => t == 101L)), Is.True, "保持の間に次の文が来ても idle_b のまま " + snapshots.FirstOrDefault(s => s.Tokens.Any(t => t != 101L)));
+            StopTalking(driver, true);
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(102L), "保持の間の次の文は話し始めではないので次は idle_c");
+        }
+
+        [Test]
+        public void Advance_KeepsTheTalkClipAndDoesNotMoveToTheNextName_WhenTalkingResumesDuringTheReturn()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(100L), "前提");
+            driver.EndTalking();
+            AssertTokens(driver.Run(0.3f).Last(), new[] { 100L, Rest }, "前提: Rest へ戻る途中");
+
+            driver.Talking = true;
+            var resumed = driver.Run(1f);
+
+            Assert.That(resumed.All(s => s.Tokens.All(t => t == 100L || t == Rest)), Is.True, "ほかの話す間用へ替えない " + resumed.FirstOrDefault(s => s.Tokens.Any(t => t != 100L && t != Rest)));
+            AssertTokens(resumed.Last(), new[] { 100L }, "戻りを取り消して idle_a だけ");
+            StopTalking(driver, true);
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(101L), "戻りの取り消しは話し始めではないので次は idle_b");
+        }
+
+        [Test]
+        public void Advance_LoopsTheTalkClipChosenAtTheStart_WhenTalkingResumesDuringAReturnThatReplacedTheTalkList()
+        {
+            // A は Time 3 秒（3 秒）から B へ混ぜ、4 秒で B だけになる。B は最後なので、次に最初に戻るところで保留が入れ替わる
+            var normal = Clips(new IdleClip(A, 4f), new IdleClip(B, 5f));
+            var talk = Named(100, "idle_a", "idle_b");
+            var reloaded = Named(200, "idle_c", "idle_d");
+            var driver = Started(normal, talk);
+            driver.SetClips(normal, reloaded);
+            AssertTokens(driver.RunTo(4.5), new[] { B }, "前提: 保留のまま B へ移った");
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(100L), "前提: 話し始めは今の一覧の idle_a");
+
+            driver.EndTalking();
+            AssertTokens(driver.Run(0.3f).Last(), new[] { 100L, A }, "前提: 最初の A へ戻る途中");
+            Assert.That(driver.Sequence.IsInUse(101L), Is.False, "前提: 最初に戻って一覧が入れ替わった（idle_b はもう使っていない）");
+            Assert.That(driver.Sequence.IsInUse(200L), Is.True, "前提: 新しい一覧を使っている");
+            driver.Talking = true;
+            AssertTokens(driver.Run(0.5f).Last(), new[] { 100L }, "前提: 戻りを取り消して idle_a だけ");
+
+            // idle_a（6 秒）は Time 2 秒。Time 5 秒から自分自身へ混ぜるので、9 秒の間に 2 回繰り返す
+            var loops = 0;
+            var previousCount = 1;
+            var frames = (int)Math.Round(9.0 / Frame);
+            for (var i = 0; i < frames; i++)
+            {
+                var now = driver.Step(Frame);
+                var at = "t=" + driver.Elapsed.ToString("0.###") + " " + now;
+                Assert.That(now.Tokens.All(t => t == 100L), Is.True, "話している間は、一覧からなくなっても話し始めの idle_a を繰り返す " + at);
+                Assert.That(driver.Sequence.IsInUse(100L), Is.True, "写っている間は使用中 " + at);
+                if (now.Count == 2 && previousCount == 1)
+                {
+                    loops++;
+                }
+
+                previousCount = now.Count;
+            }
+
+            Assert.That(loops, Is.GreaterThanOrEqualTo(2), "前提: idle_a から idle_a へ 2 回以上混ぜた");
+            StopTalking(driver, true);
+            Assert.That(driver.Sequence.IsInUse(100L), Is.False, "写らなくなり、一覧にもない");
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(200L), "新しい一覧で、前回の idle_a の次の idle_c");
+        }
+
+        [Test]
+        public void Advance_LoopsTheTalkClipChosenAtTheStart_WhenTalkingResumesDuringAReturnThatSwappedInAListKeepingItsToken()
+        {
+            // A は Time 3 秒（3 秒）から B へ混ぜ、4 秒で B だけになる。B は最後なので、次に最初に戻るところで保留が入れ替わる
+            var normal = Clips(new IdleClip(A, 4f), new IdleClip(B, 5f));
+            var talk = Named(100, "idle_a", "idle_b");
+            // Runtime は変わっていないファイルに同じ Token を使う。idle_a はそのままで、その前と後ろに名前が増え、idle_b は消えた
+            var reloaded = new[] { Talk(99, "idle_0"), Talk(100, "idle_a"), Talk(201, "idle_z") };
+            var driver = Started(normal, talk);
+            driver.SetClips(normal, reloaded);
+            AssertTokens(driver.RunTo(4.5), new[] { B }, "前提: 保留のまま B へ移った");
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(100L), "前提: 話し始めは今の一覧の idle_a");
+
+            driver.EndTalking();
+            AssertTokens(driver.Run(0.3f).Last(), new[] { 100L, A }, "前提: 最初の A へ戻る途中");
+            Assert.That(driver.Sequence.IsInUse(101L), Is.False, "前提: 最初に戻って一覧が入れ替わった（idle_b はもう使っていない）");
+            Assert.That(driver.Sequence.IsInUse(201L), Is.True, "前提: 新しい一覧を使っている");
+            driver.Talking = true;
+            AssertTokens(driver.Run(0.5f).Last(), new[] { 100L }, "前提: 戻りを取り消して idle_a だけ");
+
+            // idle_a（6 秒）は Time 2 秒。Time 5 秒から自分自身へ混ぜるので、9 秒の間に 2 回繰り返す
+            var loops = 0;
+            var previousCount = 1;
+            var frames = (int)Math.Round(9.0 / Frame);
+            for (var i = 0; i < frames; i++)
+            {
+                var now = driver.Step(Frame);
+                var at = "t=" + driver.Elapsed.ToString("0.###") + " " + now;
+                Assert.That(now.Tokens.All(t => t == 100L), Is.True, "話している間は、入れ替わった一覧の前後の名前へ移らず話し始めの idle_a を繰り返す " + at);
+                if (now.Count == 2 && previousCount == 1)
+                {
+                    loops++;
+                }
+
+                previousCount = now.Count;
+            }
+
+            Assert.That(loops, Is.GreaterThanOrEqualTo(2), "前提: idle_a から idle_a へ 2 回以上混ぜた");
+            StopTalking(driver, true);
+            Assert.That(driver.Sequence.IsInUse(100L), Is.True, "idle_a は新しい一覧にもある");
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(201L), "繰り返しは話し始めではないので、前回の idle_a の次の idle_z");
+        }
+
+        [Test]
+        public void Advance_MovesToTheTalkClipWithTheNextName_WhenTalkingStartsDuringACrossFadeOfNormalClips()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(Normal3(), talk);
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(100L), "前提");
+            StopTalking(driver, true);
+            // B は 2.4 秒に始まり、B の Time 4 秒（6.4 秒）から C へ混ぜる
+            AssertTokens(driver.RunTo(6.7), new[] { B, C }, "前提: B から C へ混ぜている途中");
+
+            var token = TalkClipAtStart(driver);
+
+            Assert.That(token, Is.EqualTo(101L), "混ぜを終えてから話す間用へ移るのも話し始めなので idle_b");
+        }
+
+        [Test]
+        public void Advance_KeepsTheTalkClip_WhenLeavingIdleAndComingBackWhileTalking()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 1), Is.EqualTo(new[] { 100L }), "前提");
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(101L), "前提: 2 回目の話し始めは idle_b");
+
+            driver.Idle = false;
+            var away = driver.Run(1f);
+            driver.Idle = true;
+            var back = driver.Run(1f);
+
+            Assert.That(away.Last().Count, Is.EqualTo(0), "前提: 本家だけ");
+            Assert.That(away.Concat(back).All(s => s.Tokens.All(t => t == 101L)), Is.True, "待機の出入りの間も idle_b のまま");
+            AssertTokens(back.Last(), new[] { 101L }, "待機に戻っても idle_b のまま");
+            StopTalking(driver, true);
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(102L), "待機の出入りでは進まないので次は idle_c");
+        }
+
+        [Test]
+        public void Advance_StartsAgainFromTheSmallestName_WhenTheSequenceIsCreatedAgain()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var first = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(first, 2), Is.EqualTo(new[] { 100L, 101L }), "前提");
+
+            var again = Started(RestOnly(), talk);
+
+            Assert.That(TalkClipAtStart(again), Is.EqualTo(100L), "作り直したら最初から");
+        }
+
+        [Test]
+        public void Advance_MovesToTheNameAfterTheLastUsedOne_WhenTheLastUsedNameIsGoneAfterAReload()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 2), Is.EqualTo(new[] { 100L, 101L }), "前提: 前回は idle_b");
+
+            var reloaded = Named(200, "idle_a", "idle_c");
+            Reload(driver, talk, reloaded);
+            var starts = TalkStarts(driver, 2);
+
+            Assert.That(starts, Is.EqualTo(new[] { 201L, 200L }), "idle_b がなくなってもその次の idle_c、そのあと最初の idle_a: " + string.Join(",", starts));
+        }
+
+        [Test]
+        public void Advance_WrapsToTheSmallestName_WhenTheLastUsedNameWasTheLargestAndIsGoneAfterAReload()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 3), Is.EqualTo(new[] { 100L, 101L, 102L }), "前提: 前回は最後の idle_c");
+
+            var reloaded = Named(200, "idle_a", "idle_b");
+            Reload(driver, talk, reloaded);
+
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(200L), "idle_c より大きい名前がないので最初の idle_a");
+        }
+
+        [Test]
+        public void Advance_MovesToTheNameAfterTheLastUsedOne_WhenNamesAreAddedBeforeAndAfterItByAReload()
+        {
+            var talk = Named(100, "idle_b", "idle_d");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 1), Is.EqualTo(new[] { 100L }), "前提: 前回は idle_b（一覧の 0 番目）");
+
+            var reloaded = Named(200, "idle_a", "idle_b", "idle_c", "idle_d");
+            Reload(driver, talk, reloaded);
+            var starts = TalkStarts(driver, 3);
+
+            Assert.That(starts, Is.EqualTo(new[] { 202L, 203L, 200L }), "一覧の位置ではなく名前で idle_b の次の idle_c から: " + string.Join(",", starts));
+        }
+
+        [Test]
+        public void Advance_MovesToANameAddedAfterTheLargest_WhenTheLargestWasUsedLast()
+        {
+            var talk = Named(100, "idle_a", "idle_b");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 2), Is.EqualTo(new[] { 100L, 101L }), "前提: 前回は最後の idle_b");
+
+            var reloaded = Named(200, "idle_a", "idle_b", "idle_c");
+            Reload(driver, talk, reloaded);
+            var starts = TalkStarts(driver, 2);
+
+            Assert.That(starts, Is.EqualTo(new[] { 202L, 200L }), "増えた idle_c が idle_b の次: " + string.Join(",", starts));
+        }
+
+        [Test]
+        public void Advance_TreatsTheLastUsedNameInAnotherLetterCaseAsTheSameName_AfterAReload()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 2), Is.EqualTo(new[] { 100L, 101L }), "前提: 前回は idle_b");
+
+            var upper = Named(200, "idle_a", "IDLE_B", "IDLE_C");
+            Reload(driver, talk, upper);
+            Assert.That(TalkStarts(driver, 1), Is.EqualTo(new[] { 202L }), "IDLE_B は idle_b と同じ名前なので、その次の IDLE_C");
+
+            var mixed = Named(300, "idle_a", "Idle_C");
+            Reload(driver, upper, mixed);
+
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(300L), "Idle_C は前回の IDLE_C と同じ名前で、より大きい名前がないので最初の idle_a");
+        }
+
+        [Test]
+        public void Advance_ContinuesAfterTheLastUsedName_WhenTalkClipsComeBackAfterTheTalkListWasEmpty()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 1), Is.EqualTo(new[] { 100L }), "前提: 前回は idle_a");
+
+            Reload(driver, talk, None());
+            Assert.That(StartTalking(driver), Is.Null, "前提: 話す間用がない間は通常のクリップのまま");
+            StopTalking(driver, true);
+
+            var reloaded = Named(200, "idle_a", "idle_b", "idle_c");
+            Reload(driver, None(), reloaded);
+
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(201L), "前回の idle_a を覚えたまま次の idle_b");
+        }
+
+        [Test]
+        public void Advance_ContinuesAfterTheLastUsedName_WhenTheNormalListWasEmptyInBetween()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 1), Is.EqualTo(new[] { 100L }), "前提: 前回は idle_a");
+
+            driver.SetClips(None(), None());
+            Assert.That(driver.Run(4.5f).Last().Count, Is.EqualTo(0), "前提: 一覧が空になって本家だけ");
+            var reloaded = Named(200, "idle_a", "idle_b", "idle_c");
+            driver.SetClips(RestOnly(), reloaded);
+            var shown = driver.Run(1.2f).Last();
+            Assert.That(shown.Own, Is.EqualTo(1f).Within(Tolerance), "前提: 空のときの SetClips はすぐ使う " + shown);
+
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(201L), "前回の idle_a を覚えたまま次の idle_b");
+        }
+
+        [Test]
+        public void Advance_ContinuesAfterTheLastUsedName_WhenEmptyNormalListsAreGivenAgainWhileTheNormalListIsEmpty()
+        {
+            var talk = Named(100, "idle_a", "idle_b", "idle_c");
+            var driver = Started(RestOnly(), talk);
+            Assert.That(TalkStarts(driver, 1), Is.EqualTo(new[] { 100L }), "前提: 前回は idle_a");
+            driver.SetClips(None(), talk);
+            Assert.That(driver.Run(4.5f).Last().Count, Is.EqualTo(0), "前提: 最初に戻って通常の一覧が空になり、本家だけ");
+            driver.Sequence.TakeReloadRequest();
+
+            // Runtime は一覧が空の間、5 秒ごとの要求で読み直して空の通常の一覧を渡す。話す間用の一覧は空のこともある
+            var lists = new[] { talk, None(), talk, None(), talk };
+            for (var i = 0; i < lists.Length; i++)
+            {
+                driver.Run(5f);
+                Assert.That(driver.Sequence.TakeReloadRequest(), Is.True, "前提: 一覧が空の間の読み直しの要求（" + i + " 回目）");
+                driver.SetClips(None(), lists[i]);
+                Assert.That(driver.Now.Count, Is.EqualTo(0), "前提: 本家だけのまま（" + i + " 回目）");
+            }
+
+            driver.SetClips(RestOnly(), talk);
+            var shown = driver.Run(1.2f).Last();
+            Assert.That(shown.Own, Is.EqualTo(1f).Within(Tolerance), "前提: 空のときの SetClips はすぐ使う " + shown);
+
+            Assert.That(TalkClipAtStart(driver), Is.EqualTo(101L), "空の一覧の読み直しが何度あっても前回の idle_a を覚えたまま次の idle_b");
+        }
+
+        [Test]
+        public void Advance_FollowsTheComparerOrder_ForNamesWithSymbolsDigitsAndLetterCase()
+        {
+            // 大文字に揃えて序数で比べるので、- と数字は英字より前、_ は英字より後ろ
+            var order = new[] { "idle", "idle-2", "idle2", "IdleA", "idleb", "idle_", "idle_2" };
+            for (var i = 1; i < order.Length; i++)
+            {
+                Assert.That(IdleFiles.NameOrder.Compare(order[i - 1], order[i]), Is.LessThan(0), "前提: " + order[i - 1] + " < " + order[i]);
+            }
+
+            // 一覧は名前の順に並べない。Token は order の位置に 100 を足したもの
+            var talk = new[] { 6, 4, 0, 3, 5, 2, 1 }.Select(i => Talk(100 + i, order[i])).ToArray();
+            var driver = Started(RestOnly(), talk);
+
+            var starts = TalkStarts(driver, order.Length + 1);
+
+            Assert.That(starts, Is.EqualTo(new[] { 100L, 101L, 102L, 103L, 104L, 105L, 106L, 100L }), ShowClips(talk) + ": " + string.Join(",", starts));
+        }
+
+        [Test]
+        public void Advance_TreatsTheLastUsedNameInAnotherLetterCaseAsTheSameName_WhenCurrentCultureIsTurkish()
+        {
+            WithTurkishCulture(() =>
+            {
+                // tr-TR の文化の比較では I と i は別の文字（I は ı の大文字）だが、序数の比較では同じ名前
+                var talk = Named(100, "idle_h", "IDLE_I", "idle_j");
+                var driver = Started(RestOnly(), talk);
+                Assert.That(TalkStarts(driver, 2), Is.EqualTo(new[] { 100L, 101L }), "前提: 前回は IDLE_I");
+
+                var reloaded = Named(200, "idle_h", "idle_i", "idle_j");
+                Reload(driver, talk, reloaded);
+
+                Assert.That(TalkClipAtStart(driver), Is.EqualTo(202L), "idle_i は前回の IDLE_I と同じ名前なので、その次の idle_j");
+            });
+        }
+
+        [Test]
+        public void Advance_GoesThroughMaxFilesTalkClipsInNameOrderAndBackToTheFirst()
+        {
+            // 名前は idle_00〜idle_31（5 の倍数は大文字）。一覧には 13 ずつ飛ばした順で並べる。Token は名前の番号に 100 を足したもの
+            var count = IdleFiles.MaxFiles;
+            var talk = new IdleClip[count];
+            for (var i = 0; i < count; i++)
+            {
+                var n = i * 13 % count;
+                talk[i] = Talk(100 + n, (n % 5 == 0 ? "IDLE_" : "idle_") + n.ToString("00", CultureInfo.InvariantCulture));
+            }
+
+            var byNumber = talk.OrderBy(c => c.Token).ToArray();
+            for (var i = 1; i < count; i++)
+            {
+                Assert.That(IdleFiles.NameOrder.Compare(byNumber[i - 1].Name, byNumber[i].Name), Is.LessThan(0), "前提: 番号の順が名前の順");
+            }
+
+            var driver = Started(RestOnly(), talk);
+
+            var starts = TalkStarts(driver, count + 1);
+
+            var expected = Enumerable.Range(0, count).Select(n => 100L + n).Concat(new[] { 100L }).ToArray();
+            Assert.That(starts, Is.EqualTo(expected), string.Join(",", starts));
+        }
+
+        [TestCase(1)]
+        [TestCase(2)]
+        [TestCase(3)]
+        [TestCase(4)]
+        public void Advance_StartsTalkingWithTheClipAfterTheLastUsedName_ForRandomTalkListsAndReloads(int seed)
+        {
+            var random = new Random(seed);
+            var names = new[] { "idle_a", "IDLE_A", "Idle_b", "idle_b", "idle-c", "idle_c", "idle2", "idle_10", "idle_9", "IDLE_Z", "", null };
+            var lengths = new[] { 6f, 6f, 6f, 6f, 6f, 0f, -1f, float.NaN, float.PositiveInfinity };
+            long nextToken = 1000;
+            Func<IdleClip[]> randomTalk = () =>
+            {
+                var count = random.Next(4) == 0 ? random.Next(3) : random.Next(IdleFiles.MaxFiles + 1);
+                var clips = new IdleClip[count];
+                for (var i = 0; i < count; i++)
+                {
+                    clips[i] = Talk(nextToken++, names[random.Next(names.Length)], lengths[random.Next(lengths.Length)]);
+                }
+
+                return clips;
+            };
+
+            var talk = randomTalk();
+            var driver = Started(RestOnly(), talk);
+            var startedBefore = false;
+            string previous = null;
+            int starts = 0, wraps = 0, reloads = 0, withoutTalkClips = 0, previousGone = 0;
+            for (var step = 0; step < 80; step++)
+            {
+                if (random.Next(3) == 0)
+                {
+                    var next = randomTalk();
+                    Reload(driver, talk, next);
+                    talk = next;
+                    reloads++;
+                    if (startedBefore && !talk.Any(c => c.Length > 0f && !float.IsInfinity(c.Length) && IdleFiles.NameOrder.Compare(c.Name, previous) == 0))
+                    {
+                        previousGone++;
+                    }
+
+                    continue;
+                }
+
+                var expected = ExpectedTalkStart(talk, startedBefore, previous);
+                var because = "seed " + seed + " step " + step + " 前回 " + (startedBefore ? ShowName(previous) : "なし") + " 一覧 " + ShowClips(talk);
+                var actual = StartTalking(driver);
+                if (expected == null)
+                {
+                    Assert.That(actual, Is.Null, because + "（有効な話す間用がない）");
+                    withoutTalkClips++;
+                }
+                else
+                {
+                    Assert.That(actual, Is.EqualTo(expected.Value.Token), because + "（期待 " + expected.Value.Token + ":" + ShowName(expected.Value.Name) + "）");
+                    if (startedBefore && IdleFiles.NameOrder.Compare(expected.Value.Name, previous) <= 0)
+                    {
+                        wraps++;
+                    }
+
+                    startedBefore = true;
+                    previous = expected.Value.Name;
+                    starts++;
+                }
+
+                StopTalking(driver, random.Next(2) == 0);
+            }
+
+            // 確かめた状態が実際に起きていること
+            Assert.That(starts, Is.GreaterThan(30), "話し始めが少ない");
+            Assert.That(wraps, Is.GreaterThan(2), "最初に戻る話し始めが少ない");
+            Assert.That(reloads, Is.GreaterThan(10), "読み直しが少ない");
+            Assert.That(withoutTalkClips, Is.GreaterThan(0), "有効な話す間用がない話し始めが一度もない");
+            Assert.That(previousGone, Is.GreaterThan(2), "前回の名前がなくなる読み直しが少ない");
+        }
+
+        /// <summary>
+        /// 通常の一覧（空・1 本・2 本以上）と話す間用の一覧を乱数で読み直しながら、話し始めのクリップが規則どおりで、話している間に
+        /// 替わらないこと。話している間には、保持の間の次の文・待機の出入り・戻りの取り消し・読み直し（話し終えて最初に戻るところで
+        /// 入れ替わることがある）を混ぜる。読み直しのあとは、前の一覧のクリップが使われなくなるまで話さずに進める。
+        /// </summary>
+        [TestCase(1)]
+        [TestCase(2)]
+        [TestCase(3)]
+        [TestCase(4)]
+        public void Advance_StartsWithTheClipAfterTheLastUsedNameAndKeepsIt_ForRandomListsReturnsAndIdleChanges(int seed)
+        {
+            var random = new Random(seed);
+            var names = new[] { "idle_a", "IDLE_A", "Idle_b", "idle_b", "idle-c", "idle_c", "idle2", "idle_10", "IDLE_Z", "", null };
+            var talkLengths = new[] { 3f, 6f, 6f, 0f, float.NaN };
+            var normalLengths = new[] { 1.5f, 2.5f, 4f };
+            long nextTalkToken = 1000;
+            long nextNormalToken = -1;
+            Func<IdleClip, bool> valid = c => c.Length > 0f && !float.IsInfinity(c.Length);
+            Func<int, IdleClip[]> randomNormal = least =>
+            {
+                var count = Math.Max(least, new[] { 0, 1, 1, 2, 3 }[random.Next(5)]);
+                var clips = new IdleClip[count];
+                for (var i = 0; i < count; i++)
+                {
+                    clips[i] = new IdleClip(nextNormalToken--, normalLengths[random.Next(normalLengths.Length)]);
+                }
+
+                return clips;
+            };
+            Func<bool, IdleClip[]> randomTalk = withValid =>
+            {
+                var count = random.Next(4) == 0 ? random.Next(2) : 1 + random.Next(6);
+                var clips = new List<IdleClip>();
+                for (var i = 0; i < count; i++)
+                {
+                    clips.Add(Talk(nextTalkToken++, names[random.Next(names.Length)], talkLengths[random.Next(talkLengths.Length)]));
+                }
+
+                if (withValid && !clips.Any(valid))
+                {
+                    clips.Add(Talk(nextTalkToken++, names[random.Next(names.Length)]));
+                }
+
+                return clips.ToArray();
+            };
+
+            var normal = randomNormal(1);
+            var talk = randomTalk(false);
+            var driver = Started(normal, talk);
+            Action<IdleClip[], IdleClip[], string> waitUntilReplaced = (oldNormal, oldTalk, because) =>
+            {
+                var old = oldNormal.Concat(oldTalk).Select(c => c.Token).ToList();
+                for (var waited = 0.0; old.Any(driver.Sequence.IsInUse); waited += Frame)
+                {
+                    Assert.That(waited, Is.LessThan(20.0), because + "（前提: 前の一覧のクリップが使われなくなる） " + driver.Now);
+                    driver.Step(Frame);
+                }
+            };
+
+            var startedBefore = false;
+            string previous = null;
+            int starts = 0, wraps = 0, reloads = 0, emptyReloads = 0, withoutTalkClips = 0, resumedReturns = 0, loopsAfterReplacedReturn = 0;
+            var normalSizes = new HashSet<int>();
+            for (var step = 0; step < 80; step++)
+            {
+                var because = "seed " + seed + " step " + step + " 前回 " + (startedBefore ? ShowName(previous) : "なし") + " 通常 " + normal.Length + " 本 話す間用 " + ShowClips(talk);
+                if (random.Next(3) == 0)
+                {
+                    // 一覧が空の間は、Runtime の読み直しと同じく空の通常の一覧が続くことがある
+                    var nextNormal = normal.Length == 0 ? (random.Next(3) == 0 ? None() : randomNormal(1)) : randomNormal(0);
+                    var nextTalk = randomTalk(false);
+                    if (normal.Length == 0 && nextNormal.Length == 0 && startedBefore)
+                    {
+                        emptyReloads++;
+                    }
+
+                    driver.SetClips(nextNormal, nextTalk);
+                    waitUntilReplaced(normal, talk, because);
+                    normal = nextNormal;
+                    talk = nextTalk;
+                    reloads++;
+                    continue;
+                }
+
+                var expected = normal.Length > 0 ? ExpectedTalkStart(talk, startedBefore, previous) : null;
+                var actual = StartTalking(driver);
+                if (expected == null)
+                {
+                    Assert.That(actual, Is.Null, because + "（話す間用へ移らない）");
+                    withoutTalkClips++;
+                    if (normal.Length > 0)
+                    {
+                        StopTalking(driver, random.Next(2) == 0);
+                    }
+                    else
+                    {
+                        driver.EndTalking();
+                        driver.Run(0.5f);
+                    }
+
+                    continue;
+                }
+
+                Assert.That(actual, Is.EqualTo(expected.Value.Token), because + "（期待 " + expected.Value.Token + ":" + ShowName(expected.Value.Name) + "）");
+                if (startedBefore && IdleFiles.NameOrder.Compare(expected.Value.Name, previous) <= 0)
+                {
+                    wraps++;
+                }
+
+                startedBefore = true;
+                previous = expected.Value.Name;
+                starts++;
+                normalSizes.Add(Math.Min(normal.Length, 2));
+                var chosen = expected.Value.Token;
+                Action<IEnumerable<Snapshot>, string> assertOnlyChosen = (snapshots, what) =>
+                {
+                    var wrong = snapshots.FirstOrDefault(s => s.Tokens.Any(t => t != chosen));
+                    Assert.That(wrong, Is.Null, because + "（" + what + "）話し始めの " + chosen + " だけが写る: " + wrong);
+                };
+
+                var variant = random.Next(6);
+                IdleClip[] replacedNormal = null;
+                IdleClip[] replacedTalk = null;
+                var replacedAtReturn = false;
+                var talking = new List<Snapshot>();
+                if (variant == 1)
+                {
+                    driver.Talking = false;
+                    var pause = driver.Run(0.2f + (float)random.NextDouble());
+                    driver.Talking = true;
+                    assertOnlyChosen(pause.Concat(driver.Run(1f)), "保持の間の次の文");
+                }
+                else if (variant == 2)
+                {
+                    driver.Idle = false;
+                    var away = driver.Run(0.3f + (float)random.NextDouble());
+                    driver.Idle = true;
+                    assertOnlyChosen(away.Concat(driver.Run(1f)), "待機の出入り");
+                }
+                else if (variant >= 3)
+                {
+                    if (variant >= 4)
+                    {
+                        replacedNormal = randomNormal(1);
+                        replacedTalk = randomTalk(true);
+                        driver.SetClips(replacedNormal, replacedTalk);
+                        reloads++;
+                    }
+
+                    if (variant == 3 || random.Next(4) != 0)
+                    {
+                        driver.EndTalking();
+                        var returning = driver.Run(0.3f);
+                        Assert.That(returning.All(s => s.Tokens.All(t => t == chosen || IsNormalToken(t))), Is.True, because + "（戻りの間に別の話す間用が写った） " + returning.Last());
+                        if (returning.Last().Tokens.Any(IsNormalToken))
+                        {
+                            resumedReturns++;
+                        }
+
+                        replacedAtReturn = replacedNormal != null && returning.Any(s => s.Tokens.Any(t => replacedNormal.Any(c => c.Token == t)));
+                        driver.Talking = true;
+                        var resumed = driver.Run(1f);
+                        Assert.That(resumed.All(s => s.Tokens.All(t => t == chosen || IsNormalToken(t))), Is.True, because + "（戻りの取り消しの間に別の話す間用が写った） " + resumed.Last());
+                        var last = resumed.Last();
+                        Assert.That(last.Count > 0 && last.Tokens.All(t => t == chosen), Is.True, because + " 戻りを取り消して話し始めの " + chosen + " だけ " + last);
+                        talking.AddRange(resumed.SkipWhile(s => s.Tokens.Any(t => t != chosen)));
+                    }
+                }
+
+                var extra = driver.Run(random.Next(7));
+                assertOnlyChosen(extra, "話し続ける");
+                talking.AddRange(extra);
+                if (replacedAtReturn && talking.Any(s => s.Count == 2))
+                {
+                    loopsAfterReplacedReturn++;
+                }
+
+                StopTalking(driver, random.Next(2) == 0);
+                if (replacedNormal != null)
+                {
+                    waitUntilReplaced(normal, talk, because);
+                    normal = replacedNormal;
+                    talk = replacedTalk;
+                }
+            }
+
+            // 確かめた状態が実際に起きていること
+            Assert.That(starts, Is.GreaterThan(15), "話し始めが少ない");
+            Assert.That(wraps, Is.GreaterThan(1), "最初に戻る話し始めが少ない");
+            Assert.That(reloads, Is.GreaterThan(10), "読み直しが少ない");
+            Assert.That(withoutTalkClips, Is.GreaterThan(0), "話す間用へ移らない話し始めが一度もない");
+            Assert.That(emptyReloads, Is.GreaterThan(0), "通常の一覧が空の間に空の一覧を渡す読み直しが一度もない");
+            Assert.That(normalSizes, Is.EquivalentTo(new[] { 1, 2 }), "通常の一覧が 1 本と 2 本以上の両方で話し始めていない");
+            Assert.That(resumedReturns, Is.GreaterThan(2), "戻りの取り消しが少ない");
+            Assert.That(loopsAfterReplacedReturn, Is.GreaterThan(0), "戻りで一覧が入れ替わったあとに話す間用を繰り返したことが一度もない");
+        }
+
+        // ---- Runtime と同じ契約の読み直し ----
+
+        private static bool IsValidClip(IdleClip clip)
+        {
+            return clip.Length > 0f && !float.IsInfinity(clip.Length);
+        }
+
+        /// <summary>
+        /// IdlePlayer が読むフォルダ 1 つ分。読み直すたびに、ファイルごとにそのまま・書き換え・消すのいずれかにし、名前を足す。
+        /// 一覧は名前の IdleFiles.NameOrder の順で、名前は大小を区別せずに重ならない。読み込んだクリップが残っていて書き換えていない
+        /// ファイルは前と同じ Token（パスは大小を区別せずに引くので、綴りだけ変わっても同じ Token）。書き換えたファイル・新しいファイルは
+        /// 新しい Token。最後に渡した一覧になく使用中でもないクリップは捨て、その Token は二度と使わない。
+        /// marker を与えたフォルダは、空でない限りその名前のファイルを読み直しのたびに書き換える（名前は一覧の最初に来るものにする）。
+        /// </summary>
+        private sealed class ContractFolder
+        {
+            private sealed class File
+            {
+                public string Name;
+                public int Version;
+                public float Length;
+            }
+
+            private sealed class Loaded
+            {
+                public long Token;
+                public int Version;
+            }
+
+            private readonly Random _random;
+            private readonly string[] _names;
+            private readonly float[] _lengths;
+            private readonly string _marker;
+            private readonly long _tokenStep;
+            private long _nextToken;
+            private int _nextVersion;
+            private readonly Dictionary<string, File> _disk = new Dictionary<string, File>(StringComparer.OrdinalIgnoreCase);
+            private readonly Dictionary<string, File> _gone = new Dictionary<string, File>(StringComparer.OrdinalIgnoreCase);
+            private readonly Dictionary<string, Loaded> _loaded = new Dictionary<string, Loaded>(StringComparer.OrdinalIgnoreCase);
+            private readonly HashSet<long> _alive = new HashSet<long>();
+            private HashSet<long> _given = new HashSet<long>();
+            private List<long> _retiring = new List<long>();
+
+            public ContractFolder(Random random, string[] names, float[] lengths, string marker, long firstToken, long tokenStep)
+            {
+                _random = random;
+                _names = names;
+                _lengths = lengths;
+                _marker = marker;
+                _nextToken = firstToken;
+                _tokenStep = tokenStep;
+            }
+
+            public bool IsEmpty
+            {
+                get { return _disk.Count == 0; }
+            }
+
+            /// <summary>読み込み済みのクリップを、綴りだけ変えたファイルで同じ Token のまま渡した回数。</summary>
+            public int RespelledKept;
+
+            /// <summary>消えたあと書き換えずに戻ったファイルに、残っていた前の Token を渡した回数。</summary>
+            public int ReturnedKept;
+
+            /// <summary>フォルダを変え（empty なら全部消し）、Runtime と同じく名前の順の一覧を返す。</summary>
+            public IdleClip[] Read(bool empty)
+            {
+                var respelled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (empty)
+                {
+                    foreach (var file in _disk.Values)
+                    {
+                        _gone[file.Name] = file;
+                    }
+
+                    _disk.Clear();
+                }
+                else
+                {
+                    var wasEmpty = _disk.Count == 0;
+                    foreach (var file in _disk.Values.ToList())
+                    {
+                        var roll = _random.Next(10);
+                        if (file.Name == _marker)
+                        {
+                            Rewrite(file);
+                        }
+                        else if (roll < 3)
+                        {
+                            _disk.Remove(file.Name);
+                            _gone[file.Name] = file;
+                        }
+                        else if (roll < 5)
+                        {
+                            Rewrite(file);
+                        }
+                        else if (_random.Next(3) == 0)
+                        {
+                            var spelled = Spell(file.Name);
+                            if (spelled != file.Name)
+                            {
+                                file.Name = spelled;
+                                respelled.Add(spelled);
+                            }
+                        }
+                    }
+
+                    if (_marker != null && !_disk.ContainsKey(_marker))
+                    {
+                        var marker = new File { Name = _marker };
+                        Rewrite(marker);
+                        _disk[_marker] = marker;
+                    }
+
+                    var adds = _random.Next(3) + (wasEmpty && _marker == null ? 1 : 0);
+                    for (var i = 0; i < adds; i++)
+                    {
+                        var free = _names.Where(n => !_disk.ContainsKey(n)).ToList();
+                        if (free.Count == 0)
+                        {
+                            break;
+                        }
+
+                        var name = free[_random.Next(free.Count)];
+                        File back;
+                        if (_gone.TryGetValue(name, out back) && _random.Next(2) == 0)
+                        {
+                            // 消える前と同じ中身のファイルが戻った。綴りは変わっていることもある
+                            back.Name = _random.Next(2) == 0 ? back.Name : Spell(name);
+                            _disk[name] = back;
+                        }
+                        else
+                        {
+                            var added = new File { Name = Spell(name) };
+                            Rewrite(added);
+                            _disk[name] = added;
+                        }
+
+                        _gone.Remove(name);
+                    }
+                }
+
+                var clips = new List<IdleClip>();
+                foreach (var file in _disk.Values.OrderBy(f => f.Name, IdleFiles.NameOrder))
+                {
+                    Loaded loaded;
+                    long token;
+                    if (_loaded.TryGetValue(file.Name, out loaded) && loaded.Version == file.Version && _alive.Contains(loaded.Token))
+                    {
+                        token = loaded.Token;
+                        if (respelled.Contains(file.Name))
+                        {
+                            RespelledKept++;
+                        }
+                        else if (!_given.Contains(token))
+                        {
+                            ReturnedKept++;
+                        }
+                    }
+                    else
+                    {
+                        token = _nextToken;
+                        _nextToken += _tokenStep;
+                        _alive.Add(token);
+                        _loaded[file.Name] = new Loaded { Token = token, Version = file.Version };
+                    }
+
+                    clips.Add(new IdleClip(token, file.Length, file.Name));
+                }
+
+                _given = new HashSet<long>(clips.Select(c => c.Token));
+                _retiring = _alive.Where(t => !_given.Contains(t)).ToList();
+                return clips.ToArray();
+            }
+
+            /// <summary>Runtime と同じく、最後に渡した一覧になく使用中でもないクリップを捨てる。</summary>
+            public void Free(IdleSequence sequence)
+            {
+                for (var i = _retiring.Count - 1; i >= 0; i--)
+                {
+                    var token = _retiring[i];
+                    if (sequence.IsInUse(token))
+                    {
+                        continue;
+                    }
+
+                    _retiring.RemoveAt(i);
+                    _alive.Remove(token);
+                    foreach (var stale in _loaded.Where(e => e.Value.Token == token).Select(e => e.Key).ToList())
+                    {
+                        _loaded.Remove(stale);
+                    }
+                }
+            }
+
+            private void Rewrite(File file)
+            {
+                file.Version = ++_nextVersion;
+                file.Length = file.Name == _marker ? _lengths.Where(l => l > 0f).ElementAt(_random.Next(_lengths.Count(l => l > 0f))) : _lengths[_random.Next(_lengths.Length)];
+            }
+
+            private string Spell(string name)
+            {
+                switch (_random.Next(3))
+                {
+                    case 0:
+                        return name.ToLowerInvariant();
+                    case 1:
+                        return name.ToUpperInvariant();
+                    default:
+                        return char.ToUpperInvariant(name[0]) + name.Substring(1).ToLowerInvariant();
+                }
+            }
+        }
+
+        /// <summary>
+        /// IdleSequence が使っている一覧をテストの側で写す。使っている通常の一覧に有効なクリップがあれば SetClips は保留になり、
+        /// 最初に戻るところで入れ替わる。保留の通常の一覧の最初の有効なクリップはいつも新しい Token なので、それが層に写れば
+        /// 入れ替わった。また、使っている一覧にあって保留の一覧にない Token は、入れ替わったあとは層に写っていなければ使用中でない。
+        /// </summary>
+        private sealed class ListsInUse
+        {
+            public IdleClip[] Normal = new IdleClip[0];
+            public IdleClip[] Talk = new IdleClip[0];
+            public bool HasPending;
+            public IdleClip[] PendingNormal = new IdleClip[0];
+            public IdleClip[] PendingTalk = new IdleClip[0];
+
+            public bool HasNormal
+            {
+                get { return Normal.Any(IsValidClip); }
+            }
+
+            // 保留の通常の一覧の最初の有効なクリップと、使っている一覧の有効なクリップのうち保留の一覧にない Token
+            private long? _pendingFirst;
+            private long[] _leaving = new long[0];
+
+            public void Given(IdleClip[] normal, IdleClip[] talk)
+            {
+                if (HasNormal)
+                {
+                    HasPending = true;
+                    PendingNormal = normal;
+                    PendingTalk = talk;
+                    _pendingFirst = normal.Where(IsValidClip).Select(c => (long?)c.Token).FirstOrDefault();
+                    var pending = new HashSet<long>(normal.Concat(talk).Select(c => c.Token));
+                    _leaving = Normal.Concat(Talk).Where(IsValidClip).Select(c => c.Token).Where(t => !pending.Contains(t)).ToArray();
+                    return;
+                }
+
+                HasPending = false;
+                Normal = normal;
+                Talk = talk;
+            }
+
+            /// <summary>保留の一覧が入れ替わったと分かったら、それを使っている一覧にして true。</summary>
+            public bool Follow(IdleSequence sequence, Snapshot now)
+            {
+                if (!HasPending)
+                {
+                    return false;
+                }
+
+                var swapped = _pendingFirst.HasValue && now.Has(_pendingFirst.Value);
+                for (var i = 0; i < _leaving.Length && !swapped; i++)
+                {
+                    swapped = !sequence.IsInUse(_leaving[i]);
+                }
+
+                if (!swapped)
+                {
+                    return false;
+                }
+
+                Normal = PendingNormal;
+                Talk = PendingTalk;
+                HasPending = false;
+                return true;
+            }
+
+            /// <summary>
+            /// まだ入れ替わっていないと言える（または保留がない）。入れ替わったあとなら、保留の一覧にない Token は層に写っているものしか
+            /// 使用中でないので、層にない使用中のものがあれば入れ替わっていない。
+            /// </summary>
+            public bool Certain(IdleSequence sequence, Snapshot now)
+            {
+                return !HasPending || (now.Count > 0 && _leaving.Any(t => sequence.IsInUse(t) && !now.Has(t)));
+            }
+
+            public override string ToString()
+            {
+                return "使用中 通常 " + ShowClips(Normal) + " 話す間用 " + ShowClips(Talk) + (HasPending ? " 保留 通常 " + ShowClips(PendingNormal) + " 話す間用 " + ShowClips(PendingTalk) : " 保留なし");
+            }
+        }
+
+        /// <summary>
+        /// Runtime と同じ契約で作った一覧（変わっていないファイルは同じ Token、名前の順、名前は重ならない）を、要求のたびと任意の
+        /// ときに読み直しながら、話し始め・保持の間の次の文・戻りの取り消し・待機の出入りを混ぜる。毎フレーム次を確かめる。
+        /// 話し始め: 写った話す間用のクリップは、使っている一覧で ExpectedTalkStart が選ぶもの。
+        /// 話している間: 話し始めから話す間用のクリップが層から消えるまで、写る話す間用のクリップは 1 つだけ（入れ替わりがあっても）。
+        /// 使用中: 層に写っている Token は IsInUse。
+        /// </summary>
+        [TestCase(1)]
+        [TestCase(2)]
+        [TestCase(3)]
+        [TestCase(4)]
+        [TestCase(5)]
+        [TestCase(6)]
+        public void Advance_ShowsOneTalkClipFromEachStartUntilItLeaves_ForReloadsThatKeepTheTokensOfUnchangedFiles(int seed)
+        {
+            var random = new Random(seed);
+            var talkNames = new[] { "idle_0", "idle_a", "idle_b", "idle-c", "idle2", "idle_10", "idle_9", "idlea", "idle_m", "idle_z" };
+            // 通常のフォルダは idle（一覧の最初）と 2 つまでのファイル。通常の一覧は空・1 本・2 本以上になる
+            var normalFolder = new ContractFolder(random, new[] { "idle_n1", "idle_n2" }, new[] { 1.5f, 2.5f, 4f, 4f, 0f }, "idle", -1, -1);
+            var talkFolder = new ContractFolder(random, talkNames, new[] { 2.5f, 4f, 6f, 6f, 0f }, null, 1000, 1);
+            var lists = new ListsInUse();
+            var driver = new Driver();
+            var sequence = driver.Sequence;
+            var deltas = new[] { 1f / 60f, 1f / 30f, 1f / 30f, 1f / 20f };
+            Func<Snapshot> step = () => driver.Step(deltas[random.Next(deltas.Length)]);
+            Func<double, Func<Snapshot, bool>, bool> runUntil = (seconds, done) =>
+            {
+                var until = driver.Elapsed + seconds;
+                while (driver.Elapsed < until)
+                {
+                    if (done(step()))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            };
+            Action<double> run = seconds => runUntil(seconds, s => false);
+
+            // 待機の度合いは idle と delta だけで決まるので、テストの側でも同じ式で追う。0 より大きいのに層がなければ自作の待機が消えた
+            var idleShare = 0f;
+            var requested = false;
+            var startedBefore = false;
+            string previous = null;
+            long? shown = null;
+            var returning = false;
+            var swappedKeeping = false;
+            var swappedDropping = false;
+            var loopCounted = false;
+            var emptyReloadsSinceStart = 0;
+            int starts = 0, wraps = 0, swapsKeeping = 0, swapsDropping = 0, loopsAfterKeeping = 0, loopsAfterDropping = 0;
+            int takenBack = 0, hiddenWhileShown = 0, emptyReloads = 0, startsAfterEmptyReloads = 0, replacedPending = 0, skippedReloads = 0;
+            var normalSizes = new HashSet<int>();
+            driver.AfterStep = (now, delta) =>
+            {
+                idleShare = driver.Idle ? Math.Min(1f, idleShare + delta / IdleSequence.EnterIdleSeconds) : Math.Max(0f, idleShare - delta / IdleSequence.LeaveIdleSeconds);
+                Func<string> because = () => "seed " + seed + " t=" + driver.Elapsed.ToString("0.###") + " " + now + " 前回 " + (startedBefore ? ShowName(previous) : "なし") + " " + lists;
+                var tokens = now.Tokens;
+                foreach (var token in tokens)
+                {
+                    if (!sequence.IsInUse(token))
+                    {
+                        Assert.That(sequence.IsInUse(token), Is.True, because() + "（写っている Token " + token + " が使用中でない）");
+                    }
+                }
+
+                if (lists.Follow(sequence, now) && shown.HasValue)
+                {
+                    if (lists.Talk.Any(c => c.Token == shown.Value))
+                    {
+                        swapsKeeping++;
+                        swappedKeeping = true;
+                    }
+                    else
+                    {
+                        swapsDropping++;
+                        swappedDropping = true;
+                    }
+                }
+
+                if (now.Count == 0)
+                {
+                    if (idleShare > 0f)
+                    {
+                        shown = null;
+                    }
+                    else if (shown.HasValue)
+                    {
+                        hiddenWhileShown++;
+                    }
+                }
+                else
+                {
+                    var talkTokens = tokens.Where(t => !IsNormalToken(t)).Distinct().ToList();
+                    if (shown.HasValue && talkTokens.Count == 0)
+                    {
+                        shown = null;
+                    }
+                    else if (shown.HasValue)
+                    {
+                        if (talkTokens.Count != 1 || talkTokens[0] != shown.Value)
+                        {
+                            Assert.That(talkTokens, Is.EqualTo(new[] { shown.Value }), because() + "（話し始めの " + shown.Value + " が層から消える前に別の話す間用のクリップが写った）");
+                        }
+
+                        if (now.Count == 2 && !IsNormalToken(tokens[0]) && IsNormalToken(tokens[1]))
+                        {
+                            returning = true;
+                        }
+                        else if (now.Count == 1 && returning)
+                        {
+                            returning = false;
+                            takenBack++;
+                        }
+
+                        if (now.Count == 2 && tokens[0] == shown.Value && tokens[1] == shown.Value && !loopCounted && (swappedKeeping || swappedDropping))
+                        {
+                            loopCounted = true;
+                            loopsAfterKeeping += swappedKeeping ? 1 : 0;
+                            loopsAfterDropping += swappedDropping ? 1 : 0;
+                        }
+                    }
+                    else if (talkTokens.Count > 0)
+                    {
+                        var expected = lists.HasNormal ? ExpectedTalkStart(lists.Talk, startedBefore, previous) : null;
+                        Assert.That(expected.HasValue, Is.True, because() + "（話す間用のクリップへ移らないはず）");
+                        Assert.That(talkTokens, Is.EqualTo(new[] { expected.Value.Token }), because() + "（話し始めは " + expected.Value.Token + ":" + ShowName(expected.Value.Name) + "）");
+                        if (startedBefore && IdleFiles.NameOrder.Compare(expected.Value.Name, previous) <= 0)
+                        {
+                            wraps++;
+                        }
+
+                        if (startedBefore && emptyReloadsSinceStart >= 2)
+                        {
+                            startsAfterEmptyReloads++;
+                        }
+
+                        startedBefore = true;
+                        previous = expected.Value.Name;
+                        starts++;
+                        normalSizes.Add(Math.Min(lists.Normal.Count(IsValidClip), 2));
+                        emptyReloadsSinceStart = 0;
+                        shown = expected.Value.Token;
+                        returning = false;
+                        swappedKeeping = false;
+                        swappedDropping = false;
+                        loopCounted = false;
+                    }
+                }
+
+                normalFolder.Free(sequence);
+                talkFolder.Free(sequence);
+                if (sequence.TakeReloadRequest())
+                {
+                    requested = true;
+                }
+            };
+
+            Func<bool> reload = () =>
+            {
+                // 保留が入れ替わったかどうかを言えるまで待つ。本家だけが見えている間は言えないので読み直さない
+                var giveUp = driver.Elapsed + 5.0;
+                for (var now = driver.Now; !lists.Certain(sequence, now); now = step())
+                {
+                    if (driver.Elapsed >= giveUp || now.Count == 0)
+                    {
+                        skippedReloads++;
+                        return false;
+                    }
+                }
+
+                var normal = normalFolder.Read(normalFolder.IsEmpty ? random.Next(3) != 0 : random.Next(5) == 0);
+                var talk = talkFolder.Read(random.Next(12) == 0);
+                if (!lists.HasNormal && normal.Length == 0)
+                {
+                    emptyReloads++;
+                    emptyReloadsSinceStart++;
+                }
+
+                replacedPending += lists.HasPending ? 1 : 0;
+                lists.Given(normal, talk);
+                driver.SetClips(normal, talk);
+                normalFolder.Free(sequence);
+                talkFolder.Free(sequence);
+                return true;
+            };
+
+            Action endTalking = () =>
+            {
+                if (random.Next(2) == 0)
+                {
+                    driver.EndTalking();
+                }
+                else
+                {
+                    driver.Talking = false;
+                }
+            };
+
+            Assert.That(reload(), Is.True, "前提: 最初の一覧");
+            run(1.2);
+            for (var round = 0; round < 150; round++)
+            {
+                if (requested)
+                {
+                    // Runtime は要求のあと、フォルダを読み終えてから SetClips する
+                    requested = false;
+                    run(random.NextDouble());
+                    reload();
+                }
+
+                if (!lists.HasNormal && !lists.HasPending)
+                {
+                    // 一覧が空の間は 5 秒ごとの要求を待つ。話しても話す間用のクリップは写らない
+                    driver.Talking = random.Next(2) == 0;
+                    runUntil(IdleSequence.EmptyReloadSeconds + 0.5, s => requested);
+                    continue;
+                }
+
+                var action = random.Next(10);
+                if (action < 2)
+                {
+                    driver.Talking = false;
+                    if (action == 0)
+                    {
+                        reload();
+                    }
+
+                    run(0.5 + 3.0 * random.NextDouble());
+                    continue;
+                }
+
+                if (action == 2 && !shown.HasValue)
+                {
+                    driver.Idle = false;
+                    run(0.3 + random.NextDouble());
+                    driver.Idle = true;
+                    run(1.0);
+                    continue;
+                }
+
+                driver.Talking = true;
+                run(1.2 + 1.3 * random.NextDouble());
+                var variant = random.Next(20);
+                if (variant < 3)
+                {
+                    // 保持の間の次の文
+                    driver.Talking = false;
+                    run(0.2 + random.NextDouble());
+                    driver.Talking = true;
+                    run(1.0);
+                }
+                else if (variant < 5)
+                {
+                    driver.Idle = false;
+                    run(0.3 + random.NextDouble());
+                    driver.Idle = true;
+                    run(1.0);
+                }
+                else if (variant < 17)
+                {
+                    // 話している間に読み直す（保留になり、戻りで最初に戻るところで入れ替わることがある）。戻りの途中で話し直す
+                    if (variant >= 9)
+                    {
+                        reload();
+                    }
+
+                    endTalking();
+                    if (runUntil(IdleSequence.TalkHoldSeconds + 2.5, s => s.Count == 2 && !IsNormalToken(s.Layers[0].Token) && IsNormalToken(s.Layers[1].Token)))
+                    {
+                        run(0.8 * random.NextDouble());
+                        driver.Talking = true;
+                        run(2.0 + 5.0 * random.NextDouble());
+                    }
+                }
+
+                run(4.0 * random.NextDouble());
+                endTalking();
+                runUntil(IdleSequence.TalkHoldSeconds + 3.0, s => !shown.HasValue);
+            }
+
+            // 確かめた組み合わせが実際に起きていること
+            var counts = "話し始め " + starts + " 一周 " + wraps + " 入れ替わり（残る " + swapsKeeping + " 残らない " + swapsDropping + "） そのあとの繰り返し（残る " + loopsAfterKeeping + " 残らない " + loopsAfterDropping + "） 戻りの取り消し " + takenBack
+                + " 見えない間 " + hiddenWhileShown + " 空の間の読み直し " + emptyReloads + " そのあとの話し始め " + startsAfterEmptyReloads + " 保留の置き換え " + replacedPending + " 綴りだけ変えて同じ Token " + talkFolder.RespelledKept + " 戻ったファイルに前の Token " + talkFolder.ReturnedKept + " 見送り " + skippedReloads;
+            Assert.That(starts, Is.GreaterThan(40), "話し始めが少ない " + counts);
+            Assert.That(wraps, Is.GreaterThan(10), "最初の名前へ戻る話し始めが少ない " + counts);
+            Assert.That(swapsKeeping, Is.GreaterThan(2), "話す間用のクリップが見えている間に、その Token が残る一覧へ入れ替わったことが少ない " + counts);
+            Assert.That(swapsDropping, Is.GreaterThan(5), "話す間用のクリップが見えている間に、その Token が残らない一覧へ入れ替わったことが少ない " + counts);
+            Assert.That(loopsAfterKeeping, Is.GreaterThan(0), "Token が残る一覧へ入れ替わったあと、戻りを取り消して繰り返したことがない " + counts);
+            Assert.That(loopsAfterDropping, Is.GreaterThan(1), "Token が残らない一覧へ入れ替わったあと、戻りを取り消して繰り返したことが少ない " + counts);
+            Assert.That(takenBack, Is.GreaterThan(10), "戻りの取り消しが少ない " + counts);
+            Assert.That(hiddenWhileShown, Is.GreaterThan(0), "話している間に待機から外れたことがない " + counts);
+            Assert.That(emptyReloads, Is.GreaterThan(5), "通常の一覧が空の間の読み直しが少ない " + counts);
+            Assert.That(startsAfterEmptyReloads, Is.GreaterThan(1), "通常の一覧が空の間に 2 回以上読み直したあとの話し始めが少ない " + counts);
+            Assert.That(replacedPending, Is.GreaterThan(5), "保留の一覧を置き換えたことが少ない " + counts);
+            Assert.That(talkFolder.RespelledKept, Is.GreaterThan(5), "綴りだけ変わったファイルに同じ Token を渡したことが少ない " + counts);
+            Assert.That(normalSizes, Is.EquivalentTo(new[] { 1, 2 }), "通常の一覧が 1 本と 2 本以上の両方で話し始めていない " + counts);
         }
 
         // ---- 使っているクリップ ----

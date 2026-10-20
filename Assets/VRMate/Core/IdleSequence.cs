@@ -3,18 +3,27 @@ using System.Collections.Generic;
 
 namespace VRMate
 {
-    /// <summary>A loaded idle clip: the caller's token for it and its length in seconds.</summary>
+    /// <summary>A loaded idle clip: the caller's token for it, its length in seconds and its motion name.</summary>
     public struct IdleClip
     {
         public IdleClip(long token, float length)
+            : this(token, length, null)
+        {
+        }
+
+        public IdleClip(long token, float length, string name)
         {
             Token = token;
             Length = length;
+            Name = name;
         }
 
         public long Token { get; }
 
         public float Length { get; }
+
+        /// <summary>May be null. Only talk clips' names are used: they choose the clip each time talking starts.</summary>
+        public string Name { get; }
     }
 
     /// <summary>One clip to copy onto the avatar this frame: pose = lerp(pose, clip at Time, Weight).</summary>
@@ -39,8 +48,11 @@ namespace VRMate
     /// <summary>
     /// Which idle clips show, at which time and weight. The normal clips play in list order, each to its
     /// end, cross-fading into the next CrossFadeSeconds before the end; the order wraps to the first.
-    /// While talking (SetTalking true, and TalkHoldSeconds after it turns false) the first talk clip
-    /// loops instead; without talk clips the current normal clip repeats. Layers are applied in index
+    /// While talking (SetTalking true, and TalkHoldSeconds after it turns false) a talk clip loops
+    /// instead: each time talking starts, the one whose name comes next in IdleFiles.NameOrder after the
+    /// one that started last time, wrapping to the smallest name. The name is remembered rather than the
+    /// token or the position, since a reload can give new tokens (a changed file) and add or remove
+    /// clips around it. Without talk clips the current normal clip repeats. Layers are applied in index
     /// order over upstream's pose, so their weights are chosen to give the shares: upstream 1 - o, one
     /// layer o, and during a cross-fade the outgoing layer o(1 - c) and the incoming layer o * c, where
     /// o = (being idle) * (own idle shown) and c is the cross-fade progress. Every share moves at a
@@ -105,6 +117,11 @@ namespace VRMate
         private int _positionBeforeReturn;
 
         private bool _reloadRequested;
+
+        // The name of the talk clip the last start of talking chose; kept across reloads. A separate flag,
+        // since the name itself may be null.
+        private bool _talkStarted;
+        private string _lastTalkName;
 
         // Advance time since the normal list in use became empty (from creation, or from the wrap that
         // emptied it); counted only while it is empty.
@@ -387,11 +404,12 @@ namespace VRMate
             {
                 if (!_current.IsTalk)
                 {
-                    StartMix(Playing.Talk(_talk), TalkFadeSeconds);
+                    StartMix(Playing.Talk(StartingTalkClip()), TalkFadeSeconds);
                 }
                 else if (_current.AtCrossFadeStart)
                 {
-                    StartMix(Playing.Talk(_talk), CrossFadeSeconds);
+                    // Still the same talk: the clip chosen when it started loops into itself.
+                    StartMix(_current.Again(), CrossFadeSeconds);
                 }
 
                 return;
@@ -454,6 +472,36 @@ namespace VRMate
             _position = next;
             RequestReloadIfLast(next);
             StartMix(Playing.Normal(_normal, next), CrossFadeSeconds);
+        }
+
+        /// <summary>
+        /// The talk clip whose name is the smallest of those greater than the last start's name; without
+        /// one (or before the first start), the smallest name. Of equal names the earlier clip. Compared
+        /// rather than found by position, so the order the caller lists the clips in does not matter.
+        /// Remembers the chosen name. _talk must not be empty.
+        /// </summary>
+        private IdleClip StartingTalkClip()
+        {
+            var smallest = 0;
+            var next = -1;
+            for (var i = 0; i < _talk.Length; i++)
+            {
+                var name = _talk[i].Name;
+                if (IdleFiles.NameOrder.Compare(name, _talk[smallest].Name) < 0)
+                {
+                    smallest = i;
+                }
+
+                if (_talkStarted && IdleFiles.NameOrder.Compare(name, _lastTalkName) > 0 && (next < 0 || IdleFiles.NameOrder.Compare(name, _talk[next].Name) < 0))
+                {
+                    next = i;
+                }
+            }
+
+            var chosen = _talk[next >= 0 ? next : smallest];
+            _talkStarted = true;
+            _lastTalkName = chosen.Name;
+            return chosen;
         }
 
         private void StartMix(Playing incoming, float seconds)
@@ -528,7 +576,7 @@ namespace VRMate
 
             public float Length { get; }
 
-            /// <summary>Position in the normal list; -1 for the talk clip.</summary>
+            /// <summary>Position in the normal list; -1 for a talk clip.</summary>
             public int Index { get; }
 
             public bool IsTalk
@@ -549,9 +597,15 @@ namespace VRMate
                 return new Playing(clips[index].Token, clips[index].Length, index);
             }
 
-            public static Playing Talk(IdleClip[] clips)
+            public static Playing Talk(IdleClip clip)
             {
-                return new Playing(clips[0].Token, clips[0].Length, -1);
+                return new Playing(clip.Token, clip.Length, -1);
+            }
+
+            /// <summary>The same clip from its start.</summary>
+            public Playing Again()
+            {
+                return new Playing(Token, Length, Index);
             }
 
             /// <summary>Stops at the end: the last pose holds while the next clip fades in.</summary>

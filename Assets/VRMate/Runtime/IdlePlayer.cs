@@ -8,9 +8,10 @@ using UnityEngine;
 namespace VRMate
 {
     /// <summary>
-    /// Plays the .vrma files in VRMate/Idle in place of upstream's idle on a VRM 1.0 avatar, and the
-    /// first one in VRMate/Talk while the avatar talks. IdleSequence decides which clips show, when and
-    /// how much; this component reads the folders, keeps the clips loaded and copies their humanoid
+    /// Plays the .vrma files in VRMate/Idle in place of upstream's idle on a VRM 1.0 avatar, and one of
+    /// those in VRMate/Talk while the avatar talks (the next by name each time talking starts).
+    /// IdleSequence decides which clips show, when and how much; this component reads the folders,
+    /// gives each clip its motion name, keeps the clips loaded and copies their humanoid
     /// poses with HumanPoseHandler. The avatar's Animator is never touched: without a loadable idle clip,
     /// or outside idle, upstream's body shows as before. The folders are read again when the avatar
     /// changes and whenever IdleSequence asks (the order is about to wrap to the first clip).
@@ -382,7 +383,7 @@ namespace VRMate
                 if (TryReuse(file, out token))
                 {
                     claimed.Add(token);
-                    result.Add(new IdleClip(token, clips[token].Clip.length));
+                    result.Add(new IdleClip(token, clips[token].Clip.length, file.Name));
                     continue;
                 }
 
@@ -421,7 +422,7 @@ namespace VRMate
                     files.Remove(file.Path);
                 }
 
-                result.Add(new IdleClip(token, loaded.Clip.Clip.length));
+                result.Add(new IdleClip(token, loaded.Clip.Clip.length, file.Name));
             }
 
             return result;
