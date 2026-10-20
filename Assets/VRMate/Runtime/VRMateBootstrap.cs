@@ -22,6 +22,7 @@ namespace VRMate
             root.AddComponent<ExpressionPlayer>();
             root.AddComponent<IdlePlayer>();
             root.AddComponent<MotionPlayer>();
+            root.AddComponent<WindowSitProbe>();
             root.AddComponent<BrainLink>();
         }
     }
