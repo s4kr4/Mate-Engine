@@ -108,6 +108,9 @@ public class SaveLoadHandler : MonoBehaviour
     {
         public enum WindowSizeState { Normal, Big, Small }
         public WindowSizeState windowSizeState = WindowSizeState.Normal;
+        public bool hasWindowPosition = false;
+        public float windowPositionX;
+        public float windowPositionY;
 
         public float soundThreshold = 0.2f;
         public float idleSwitchTime = 10f;
