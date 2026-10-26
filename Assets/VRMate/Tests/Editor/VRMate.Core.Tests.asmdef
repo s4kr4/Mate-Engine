@@ -3,6 +3,10 @@
     "rootNamespace": "VRMate.Tests",
     "references": [
         "VRMate.Core",
+        "VRM10",
+        "VRM",
+        "SpringBoneJobs",
+        "UniGLTF",
         "UnityEngine.TestRunner",
         "UnityEditor.TestRunner"
     ],

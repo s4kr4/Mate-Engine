@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using UnityEngine;
 using VRM;
 using UniVRM10;
+using UniGLTF.SpringBoneJobs.Blittables;
 using System.Diagnostics;
 
 public class AvatarGravityController : MonoBehaviour
@@ -20,9 +21,11 @@ public class AvatarGravityController : MonoBehaviour
     private Vector3 currentForce;
 
     private List<VRMSpringBone> springBones = new();
-    private List<VRM10SpringBoneJoint> springBoneJoints = new();
     private Vrm10Instance vrm10Instance;
     private IntPtr unityHWND;
+
+    // Test seam: replace the window position source
+    private Func<Vector2Int> windowPositionProvider;
 
     void Start()
     {
@@ -31,9 +34,6 @@ public class AvatarGravityController : MonoBehaviour
 
         // VRM0 spring bones
         springBones.AddRange(GetComponentsInChildren<VRMSpringBone>(true));
-
-        // VRM1 spring joints
-        springBoneJoints.AddRange(GetComponentsInChildren<VRM10SpringBoneJoint>(true));
 
         // VRM1 runtime handler
         vrm10Instance = GetComponentInParent<Vrm10Instance>();
@@ -61,21 +61,21 @@ public class AvatarGravityController : MonoBehaviour
                 spring.ExternalForce = currentForce;
         }
 
-        // VRM1: apply gravity dir/power and notify runtime
-        foreach (var joint in springBoneJoints)
-        {
-            if (joint == null) continue;
-
-            joint.m_gravityDir = currentForce.normalized;
-            joint.m_gravityPower = currentForce.magnitude;
-
-            if (vrm10Instance != null && vrm10Instance.Runtime != null)
-            {
-                vrm10Instance.Runtime.SpringBone.SetJointLevel(joint.transform, joint.Blittable);
-            }
-        }
+        // VRM1: set model-level external force
+        // Joint gravity is left as loaded from the .vrm so the avatar keeps its authored sway
+        ApplyVrm10ModelLevel(new BlittableModelLevel { ExternalForce = currentForce });
 
         previousWindowPos = currentWindowPos;
+    }
+
+    private void ApplyVrm10ModelLevel(BlittableModelLevel level)
+    {
+        if (vrm10Instance == null) return;
+
+        var spring = vrm10Instance.Runtime?.SpringBone;
+        if (spring == null) return;
+
+        spring.SetModelLevel(vrm10Instance.transform, level);
     }
 
     void OnDrawGizmos()
@@ -91,6 +91,9 @@ public class AvatarGravityController : MonoBehaviour
 
     private Vector2Int GetWindowPosition()
     {
+        if (windowPositionProvider != null)
+            return windowPositionProvider();
+
         GetWindowRect(unityHWND, out RECT rect);
         return new Vector2Int(rect.left, rect.top);
     }
