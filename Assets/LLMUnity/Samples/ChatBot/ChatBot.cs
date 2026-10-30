@@ -79,8 +79,8 @@ namespace LLMUnitySamples
         // VRMate: replies come from the brain through SpeechPlayer instead of LLMUnity.
         private const string notConnectedPlaceholder = "頭脳につながっていません";
         private SpeechPlayer speechPlayer;
-        private Bubble currentAiBubble;
-        private ReplyId currentAiReply;
+        // VRMate: the Markdown converter rewrites the bubble's text, so replies are written from the raw text kept in Core.
+        private ReplyBubbleWriter<Bubble> aiReplyWriter;
         private bool? placeholderConnected;
 
 
@@ -133,6 +133,7 @@ namespace LLMUnitySamples
             FindAvatarSmart();
 
             // VRMate: no LLMUnity warm-up or history; input is open as soon as the panel exists.
+            aiReplyWriter = new ReplyBubbleWriter<Bubble>(new AiBubbleView(this));
             SubscribeSpeechPlayer();
             warmUpDone = true;
             UpdateConnectionPlaceholder();
@@ -154,21 +155,25 @@ namespace LLMUnitySamples
 
         void OnSpeechTextAppended(long connection, long turn, string text)
         {
-            if (inputBubble == null || string.IsNullOrEmpty(text)) return;
+            if (inputBubble == null) return;
 
-            // One AI bubble per reply; a trimmed bubble cannot be appended to, so start a new one.
+            // One AI bubble per reply; the writer starts a new one when the bubble was trimmed.
             // VRMate: a restarted brain counts turns from the start again, so a reply is the connection and turn together.
-            var reply = new ReplyId(connection, turn);
-            if (currentAiBubble == null || reply != currentAiReply || !chatBubbles.Contains(currentAiBubble))
-            {
-                currentAiBubble = AddBubble(text, false);
-                currentAiReply = reply;
-            }
-            else
-            {
-                currentAiBubble.SetText(currentAiBubble.GetText() + text);
-                layoutDirty = true;
-            }
+            aiReplyWriter.Append(connection, turn, text);
+        }
+
+        // VRMate: lets the Core writer add, rewrite and check AI bubbles.
+        private sealed class AiBubbleView : IReplyBubbleView<Bubble>
+        {
+            private readonly ChatBot owner;
+
+            public AiBubbleView(ChatBot owner) { this.owner = owner; }
+
+            public Bubble Add(string text) { return owner.AddBubble(text, false); }
+
+            public void Set(Bubble bubble, string text) { bubble.SetText(text); owner.layoutDirty = true; }
+
+            public bool IsShown(Bubble bubble) { return owner.chatBubbles.Contains(bubble); }
         }
 
         void UpdateConnectionPlaceholder()
