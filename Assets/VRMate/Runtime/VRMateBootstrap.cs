@@ -21,6 +21,7 @@ namespace VRMate
             root.AddComponent<SpeechPlayer>();
             root.AddComponent<ExpressionPlayer>();
             root.AddComponent<IdlePlayer>();
+            root.AddComponent<WalkPlayer>();
             root.AddComponent<MotionPlayer>();
             root.AddComponent<WindowSitProbe>();
             root.AddComponent<WindowPlacementKeeper>();
