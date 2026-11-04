@@ -15,7 +15,10 @@ namespace VRMate
     /// VRMate/Walk (in IdleFiles name order). WalkSequence decides when, which way and how far; this
     /// component gathers its input (the avatar's state, the body's rectangle and the pixels per metre
     /// from the camera, the monitors), moves the window sideways with UniWindowController and copies
-    /// the walk pose, turned toward the way it goes, with HumanPoseHandler. The avatar's Animator is
+    /// the walk pose, turned toward the way it goes, with HumanPoseHandler. Before a walk it holds the
+    /// own idle (IdlePlayer) and starts once that is at a boundary between clips; the clip starts where
+    /// its legs are closest to the idle pose of that moment, compared with leg samples taken when the
+    /// clip is loaded (WalkRestTimes). The avatar's Animator is
     /// never touched (upstream's AvatarLocomotionController and its Locomotion Layer are left alone).
     /// The folder is read when the avatar changes (startup included); without it, or without a
     /// loadable clip, or on a VRM 0.x avatar, the avatar does not walk. In the editor the folder is still
@@ -31,7 +34,14 @@ namespace VRMate
         // The folder never offers more candidates than this.
         private const int MaxFailedFiles = IdleFiles.MaxFiles;
 
-        // Only the few fixed kinds (idle state, avatar, reload, listing, no clip, apply): never runs out of keys.
+        // The clip is sampled this often to find where its legs are closest to the idle's.
+        private const float SampleInterval = 1f / 30f;
+
+        // A minute of samples. A longer clip is sampled more sparsely, so loading never stalls for long
+        // and the per-frame comparison stays small.
+        private const int MaxSamples = 1800;
+
+        // Only the few fixed kinds (idle state, avatar, reload, listing, no clip, apply, sample, rest): never runs out of keys.
         private readonly WarnOnce warnings = new WarnOnce();
 
         // Problems with the files present now, counted afresh on every reload.
@@ -46,6 +56,16 @@ namespace VRMate
         private readonly List<ScreenRect> monitors = new List<ScreenRect>();
         private readonly List<Renderer> renderers = new List<Renderer>();
         private readonly Vector3[] corners = new Vector3[8];
+        private readonly List<float> restTimes = new List<float>();
+
+        // The muscles of the legs, feet and toes: where the feet are decides whether they slide at the joins.
+        private static int[] legMuscles;
+
+        // The clip's leg muscles at each sample (sample-major), and the sum of squared differences from
+        // the avatar's pose per sample. Null when sampling failed: the walk then starts at 0.
+        private float[] legSamples;
+        private float[] differences;
+        private float sampleInterval;
 
         private string folder;
         private WalkSequence sequence;
@@ -66,8 +86,15 @@ namespace VRMate
         private HumanPoseHandler avatarPose;
         private HumanPose targetPose;
         private HumanPose sourcePose;
+        private HumanPose measuredPose;
 
         public static WalkPlayer Instance { get; private set; }
+
+        /// <summary>The own idle should stay where it is: the walk waits for its boundary, or the walk pose shows.</summary>
+        public bool HoldIdle
+        {
+            get { return sequence != null && sequence.HoldIdle; }
+        }
 
         private void Awake()
         {
@@ -106,7 +133,20 @@ namespace VRMate
             Measure(out pixelsPerMeter, out body);
             ReadMonitors();
 
-            sequence.Advance(Time.deltaTime, new WalkInput(canWalk, talking, pixelsPerMeter, body, monitors));
+            var idle = IdlePlayer.Instance;
+            var idleAtBoundary = idle == null || idle.HeldAtBoundary;
+
+            // Only a frame that may start the walk needs them. With the own idle held this is the one frame
+            // it reaches the boundary; with upstream's idle, which never holds, it is every frame of the wait.
+            var startTime = float.NaN;
+            IReadOnlyList<float> rests = null;
+            if (canWalk && idleAtBoundary && !sequence.IsWalking && sequence.Weight == 0f && FindRestTimes(out startTime))
+            {
+                rests = restTimes;
+            }
+
+            var length = clip != null ? clip.Clip.length : float.NaN;
+            sequence.Advance(Time.deltaTime, new WalkInput(canWalk, talking, pixelsPerMeter, body, monitors, idleAtBoundary, length, startTime, rests));
             MoveWindow();
             ApplyPose();
         }
@@ -405,6 +445,127 @@ namespace VRMate
             }
 
             clipBroken = false;
+            legSamples = null;
+            differences = null;
+        }
+
+        /// <summary>
+        /// Keeps the clip's leg muscles every sampleInterval seconds, read the way VrmaClipLoader.ApplyPose
+        /// reads the clip (sampled onto its hidden humanoid). On failure the walk still plays, from 0.
+        /// </summary>
+        private void SampleLegs()
+        {
+            legSamples = null;
+            differences = null;
+            try
+            {
+                var legs = LegMuscles();
+                var length = clip.Clip.length;
+                sampleInterval = Mathf.Max(SampleInterval, length / MaxSamples);
+
+                // Every sample time i × interval stays below the length: the clip repeats, so its end is its start.
+                var count = Mathf.Clamp(Mathf.CeilToInt(length / sampleInterval), 1, MaxSamples);
+                while (count > 1 && (count - 1) * sampleInterval >= length)
+                {
+                    count--;
+                }
+
+                var samples = new float[count * legs.Length];
+                for (var i = 0; i < count; i++)
+                {
+                    clip.Clip.SampleAnimation(clip.Root, i * sampleInterval);
+                    clip.Pose.GetHumanPose(ref measuredPose);
+                    var muscles = measuredPose.muscles;
+                    for (var j = 0; j < legs.Length; j++)
+                    {
+                        samples[i * legs.Length + j] = muscles[legs[j]];
+                    }
+                }
+
+                legSamples = samples;
+                differences = new float[count];
+            }
+            catch (Exception e)
+            {
+                Warn("sample", "cannot sample walk motion '" + clip.Name + "'; the walk starts at its beginning: " + e.Message);
+            }
+        }
+
+        /// <summary>
+        /// Where the clip's legs are closest to the avatar's pose now (the idle's, written earlier this
+        /// frame), and where they come close again. False when the clip was not sampled or none is found.
+        /// </summary>
+        private bool FindRestTimes(out float startTime)
+        {
+            startTime = float.NaN;
+            if (legSamples == null || avatarPose == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var legs = LegMuscles();
+                avatarPose.GetHumanPose(ref measuredPose);
+                var muscles = measuredPose.muscles;
+                for (var i = 0; i < differences.Length; i++)
+                {
+                    var sum = 0f;
+                    for (var j = 0; j < legs.Length; j++)
+                    {
+                        var d = muscles[legs[j]] - legSamples[i * legs.Length + j];
+                        sum += d * d;
+                    }
+
+                    // NaN from a broken file stays NaN, and WalkRestTimes leaves that sample out.
+                    differences[i] = sum;
+                }
+            }
+            catch (Exception e)
+            {
+                Warn("rest", "cannot compare the walk motion with the idle pose: " + e.Message);
+                restTimes.Clear();
+                return false;
+            }
+
+            return WalkRestTimes.TryFind(differences, sampleInterval, restTimes, out startTime);
+        }
+
+        private static int[] LegMuscles()
+        {
+            if (legMuscles == null)
+            {
+                var found = new List<int>();
+                for (var i = 0; i < HumanTrait.MuscleCount; i++)
+                {
+                    if (IsLegBone(HumanTrait.BoneFromMuscle(i)))
+                    {
+                        found.Add(i);
+                    }
+                }
+
+                legMuscles = found.ToArray();
+            }
+
+            return legMuscles;
+        }
+
+        private static bool IsLegBone(int bone)
+        {
+            switch ((HumanBodyBones)bone)
+            {
+                case HumanBodyBones.LeftUpperLeg:
+                case HumanBodyBones.LeftLowerLeg:
+                case HumanBodyBones.LeftFoot:
+                case HumanBodyBones.LeftToes:
+                case HumanBodyBones.RightUpperLeg:
+                case HumanBodyBones.RightLowerLeg:
+                case HumanBodyBones.RightFoot:
+                case HumanBodyBones.RightToes:
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         private bool IsCurrent(int pass)
@@ -493,6 +654,7 @@ namespace VRMate
 
                 clip = first;
                 clipBroken = false;
+                SampleLegs();
             }
             catch (Exception e)
             {

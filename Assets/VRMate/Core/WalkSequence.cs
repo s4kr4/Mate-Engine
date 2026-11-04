@@ -6,13 +6,26 @@ namespace VRMate
     /// <summary>What WalkSequence needs to know this frame. Rectangles are in the window system's coordinates.</summary>
     public readonly struct WalkInput
     {
-        public WalkInput(bool canWalk, bool talking, float pixelsPerMeter, ScreenRect body, IReadOnlyList<ScreenRect> monitors)
+        public WalkInput(
+            bool canWalk,
+            bool talking,
+            float pixelsPerMeter,
+            ScreenRect body,
+            IReadOnlyList<ScreenRect> monitors,
+            bool idleAtBoundary,
+            float clipLength,
+            float startTime,
+            IReadOnlyList<float> restTimes)
         {
             CanWalk = canWalk;
             Talking = talking;
             PixelsPerMeter = pixelsPerMeter;
             Body = body;
             Monitors = monitors;
+            IdleAtBoundary = idleAtBoundary;
+            ClipLength = clipLength;
+            StartTime = startTime;
+            RestTimes = restTimes;
         }
 
         /// <summary>VRM 1.0, idle, no tag motion, no input field focused and a walk clip loaded.</summary>
@@ -28,18 +41,38 @@ namespace VRMate
 
         /// <summary>May be null.</summary>
         public IReadOnlyList<ScreenRect> Monitors { get; }
+
+        /// <summary>The own idle is held where it would move on to its next clip; always true without own idle clips.</summary>
+        public bool IdleAtBoundary { get; }
+
+        /// <summary>The walk clip's length in seconds.</summary>
+        public float ClipLength { get; }
+
+        /// <summary>Clip seconds to start the walk at, in [0, ClipLength).</summary>
+        public float StartTime { get; }
+
+        /// <summary>
+        /// Clip seconds where the pose is close to the idle's (WalkRestTimes), in any order; values outside
+        /// [0, ClipLength) are not used. May be null. Without a usable one, or with ClipLength or StartTime
+        /// out of range, the walk starts at 0 and slows down by the distance left alone.
+        /// </summary>
+        public IReadOnlyList<float> RestTimes { get; }
     }
 
     /// <summary>
     /// When the avatar walks, which way, and how far the window moves this frame. Once the avatar has
-    /// been able to walk without a break for a random wait, it walks a random distance left or right,
-    /// moving the window sideways at FootSpeed (m/s, the speed the walk clip's feet move at) times the
-    /// pixels per metre times sin(TurnDegrees), times the walk weight. The walk ends early when the
-    /// body's edge reaches the edge of the monitor it started on, and the next walk then goes the other
-    /// way. When walking stops being possible the window stops at once and the weight falls to 0 over
-    /// FadeOut. The window never moves vertically. The random source is drawn in a fixed order: the
-    /// wait whenever a wait starts, then at the start of a walk the distance and (only when both ways
-    /// are open) the direction. Not thread-safe; call from one thread.
+    /// been able to walk without a break for a random wait, it asks the idle to hold (HoldIdle) and
+    /// starts on the first frame the idle is at a boundary. It walks a random distance left or right at
+    /// a random speed scale k: the clip plays k seconds a second, and the window moves sideways at
+    /// FootSpeed (m/s, the speed the walk clip's feet move at at k = 1) times k times the pixels per
+    /// metre times sin(TurnDegrees), times the walk weight, so the feet do not slide. The clip starts at
+    /// StartTime; the slow-down starts when the clip passes a rest time from which the next one is out
+    /// of reach, or, failing that, when only the stopping distance is left. The walk ends early when
+    /// the body's edge reaches the edge of the monitor it started on, and the next walk then goes the
+    /// other way. When walking stops being possible the window stops at once and the weight falls to 0
+    /// over FadeOut. The window never moves vertically. The random source is drawn in a fixed order:
+    /// the wait whenever a wait starts, then at the start of a walk the distance, (only when both ways
+    /// are open) the direction and the speed scale. Not thread-safe; call from one thread.
     /// </summary>
     public sealed class WalkSequence
     {
@@ -52,6 +85,10 @@ namespace VRMate
 
         /// <summary>Metres per second the planted foot moves back relative to the hips in the walk clip.</summary>
         public const float FootSpeed = 0.5f;
+
+        /// <summary>Each walk plays the clip, and moves the window, this many times as fast (drawn per walk).</summary>
+        public const float MinSpeedScale = 0.5f;
+        public const float MaxSpeedScale = 0.75f;
 
         /// <summary>The body turns this far toward the way it walks.</summary>
         public const float TurnDegrees = 90f;
@@ -77,8 +114,14 @@ namespace VRMate
         private ScreenRect _monitor;
         private double _distance;
         private double _walked;
+        private double _scale = MinSpeedScale;
         private bool _ending;
         private bool _endingAtEdge;
+
+        // This walk's clip length and rest times (sorted, within [0, length)); empty when the walk
+        // started at 0 because the clip input was not usable.
+        private readonly List<double> _restTimes = new List<double>();
+        private double _clipLength;
 
         // The last walk ended at the monitor's edge: the next one goes the other way.
         private bool _stoppedAtEdge;
@@ -100,7 +143,10 @@ namespace VRMate
         /// <summary>-1 left, +1 right. Kept after a walk, so the pose fades out facing the same way.</summary>
         public int Direction { get; private set; }
 
-        /// <summary>Seconds since the walk started; it keeps running while the pose fades out.</summary>
+        /// <summary>
+        /// Clip seconds: from the start time, k a second, and running on while the pose fades out. Not
+        /// wrapped to the clip's length (the caller does that).
+        /// </summary>
         public float Time { get; private set; }
 
         /// <summary>Pixels to move the window sideways this frame (signed).</summary>
@@ -108,6 +154,15 @@ namespace VRMate
 
         /// <summary>Walking, its start and its slowing down at the end included; a fade after a break is not.</summary>
         public bool IsWalking { get; private set; }
+
+        /// <summary>
+        /// The idle should not move on to its next clip: the wait is over and the walk waits for the idle's
+        /// boundary, or the walk pose shows.
+        /// </summary>
+        public bool HoldIdle
+        {
+            get { return Weight > 0f || IsWalking || (_waiting && _waited >= _waitSeconds); }
+        }
 
         /// <summary>Moves time by delta seconds (negative or non-finite counts as 0; at most MaxDeltaSeconds).</summary>
         public void Advance(float delta, WalkInput input)
@@ -162,7 +217,9 @@ namespace VRMate
             }
 
             _waited += delta;
-            if (_waited >= _waitSeconds)
+
+            // Past the wait the walk holds the idle until it reaches a boundary, so no idle clip is cut short.
+            if (_waited >= _waitSeconds && input.IdleAtBoundary)
             {
                 _waiting = false;
                 if (TryStart(input))
@@ -175,7 +232,7 @@ namespace VRMate
 
         private void FadeAway(float delta)
         {
-            Time += delta;
+            Time = (float)(Time + _scale * delta);
             Weight = Math.Max(0f, Weight - delta / FadeOut);
         }
 
@@ -185,14 +242,17 @@ namespace VRMate
         /// </summary>
         private void Walk(float delta, WalkInput input, bool first)
         {
-            Time += delta;
+            var previousTime = Time;
+            Time = (float)(Time + _scale * delta);
             var gap = Gap(input.Body, _monitor, Direction);
             var left = _distance - _walked;
             var remaining = Math.Min(left, gap);
-            var speed = FullSpeed(input.PixelsPerMeter);
+            var fullSpeed = FullSpeed(input.PixelsPerMeter);
+            var speed = fullSpeed * _scale;
 
             // Starting the slow-down half its length before the end lands the stop near it: the weight falls linearly over FadeOut.
-            if (!_ending && remaining <= speed * FadeOut / 2.0)
+            var stopping = speed * FadeOut / 2.0;
+            if (!_ending && (remaining <= stopping || RestTimeEnds(previousTime, Time, fullSpeed, stopping, remaining)))
             {
                 _ending = true;
                 _endingAtEdge = gap < left;
@@ -210,6 +270,66 @@ namespace VRMate
                 IsWalking = false;
                 _stoppedAtEdge = _endingAtEdge;
             }
+        }
+
+        /// <summary>
+        /// The clip passed a rest time this frame, and from there the next rest time is out of reach:
+        /// going on to it and then stopping would take more than is left. A clip second moves the
+        /// window by the full speed at k = 1 whatever k is, since k scales both.
+        /// </summary>
+        private bool RestTimeEnds(double previousTime, double time, double fullSpeed, double stopping, double remaining)
+        {
+            if (_restTimes.Count == 0 || !(time > previousTime))
+            {
+                return false;
+            }
+
+            var passed = LastRestTimeAtOrBefore(time);
+            if (!(passed > previousTime))
+            {
+                return false;
+            }
+
+            return (NextRestTimeAfter(passed) - passed) * fullSpeed + stopping > remaining;
+        }
+
+        /// <summary>The latest of the rest times repeated every clip length that is at most time.</summary>
+        private double LastRestTimeAtOrBefore(double time)
+        {
+            // From one period above floor(time / length) down: rounding may put time in either neighbour.
+            var period = Math.Floor(time / _clipLength);
+            for (var p = period + 1.0; p >= period - 1.0; p--)
+            {
+                var origin = p * _clipLength;
+                for (var i = _restTimes.Count - 1; i >= 0; i--)
+                {
+                    if (origin + _restTimes[i] <= time)
+                    {
+                        return origin + _restTimes[i];
+                    }
+                }
+            }
+
+            return double.NegativeInfinity;
+        }
+
+        /// <summary>The earliest of the rest times repeated every clip length that is greater than time.</summary>
+        private double NextRestTimeAfter(double time)
+        {
+            var period = Math.Floor(time / _clipLength);
+            for (var p = period - 1.0; p <= period + 1.0; p++)
+            {
+                var origin = p * _clipLength;
+                for (var i = 0; i < _restTimes.Count; i++)
+                {
+                    if (origin + _restTimes[i] > time)
+                    {
+                        return origin + _restTimes[i];
+                    }
+                }
+            }
+
+            return double.PositiveInfinity;
         }
 
         /// <summary>False when the body is as wide as the monitor or no way has room: the avatar waits again.</summary>
@@ -231,7 +351,8 @@ namespace VRMate
             IsWalking = true;
             Direction = direction;
             Weight = 0f;
-            Time = 0f;
+            _scale = MinSpeedScale + Draw() * (MaxSpeedScale - MinSpeedScale);
+            Time = TakeClipInput(input) ? input.StartTime : 0f;
             _monitor = monitor;
             _distance = distance;
             _walked = 0.0;
@@ -239,6 +360,34 @@ namespace VRMate
             _endingAtEdge = false;
             _stoppedAtEdge = false;
             return true;
+        }
+
+        /// <summary>
+        /// Keeps this walk's clip length and rest times. False (and no rest times) when the length is not
+        /// positive and finite, the start time is not in [0, length), or no rest time is.
+        /// </summary>
+        private bool TakeClipInput(WalkInput input)
+        {
+            _restTimes.Clear();
+            var length = input.ClipLength;
+            var start = input.StartTime;
+            if (!IsPositiveFinite(length) || !(start >= 0f && start < length) || input.RestTimes == null)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < input.RestTimes.Count; i++)
+            {
+                var rest = input.RestTimes[i];
+                if (rest >= 0f && rest < length)
+                {
+                    _restTimes.Add(rest);
+                }
+            }
+
+            _restTimes.Sort();
+            _clipLength = length;
+            return _restTimes.Count > 0;
         }
 
         private bool TryChooseDirection(ScreenRect body, ScreenRect monitor, double distance, out int direction)

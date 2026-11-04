@@ -76,6 +76,15 @@ namespace VRMate
 
         public static IdlePlayer Instance { get; private set; }
 
+        /// <summary>
+        /// The own idle is held at a boundary between clips, or there is no own idle to wait for (upstream's
+        /// idle shows): a walk may start without cutting an idle clip short.
+        /// </summary>
+        public bool HeldAtBoundary
+        {
+            get { return sequence == null || !sequence.HasNormalClips || sequence.HeldAtBoundary; }
+        }
+
         /// <summary>Cancel and disconnect: return to the normal order without waiting for the talk hold.</summary>
         public void EndTalking()
         {
@@ -113,6 +122,10 @@ namespace VRMate
 
             var speech = SpeechPlayer.Instance;
             sequence.SetTalking(speech != null && speech.IsTalking);
+
+            // WalkPlayer runs after this component, so its request from the last frame applies here.
+            var walk = WalkPlayer.Instance;
+            sequence.SetHold(walk != null && walk.HoldIdle);
             sequence.Advance(Time.deltaTime, IsIdle());
             if (sequence.TakeReloadRequest())
             {

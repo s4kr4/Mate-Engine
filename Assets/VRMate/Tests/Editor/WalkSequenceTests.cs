@@ -7,10 +7,12 @@ using NUnit.Framework;
 namespace VRMate.Tests
 {
     /// <summary>
-    /// 歩きの判断。歩き出せる状態が待ち時間だけ途切れずに続いたら、左か右へ距離 D だけ表示領域を横に動かし、
+    /// 歩きの判断。歩き出せる状態が待ち時間だけ途切れずに続き、待機が切れ目に来たら、左か右へ距離 D だけ表示領域を横に動かし、
     /// 体の進む向きの端が歩き始めたモニターの端に着いたらそこで止まる。歩き出せる状態が崩れたらそのフレームから動かさず、重みを 0.3 秒で 0 に戻す。
+    /// 歩きごとに倍率 k（0.5〜0.75）を選び、表示領域の速さもクリップの時刻の進みも k 倍にする。
+    /// クリップの時刻は歩き出しの時刻から始まり、自然に終わるときは待機に近い時刻で重みを下げ始める。
     /// テストでは Runtime と同じく、毎フレームの StepX だけ体の矩形を横に動かして次のフレームの入力にする。
-    /// 乱数は呼ばれる順（待ち時間 → 距離 → 向き）に決め打ちの値を返す。各テストの仕様文は Description に書く。
+    /// 乱数は呼ばれる順（待ち時間 → 距離 → 向き → 倍率）に決め打ちの値を返す。各テストの仕様文は Description に書く。
     /// </summary>
     public class WalkSequenceTests
     {
@@ -62,10 +64,28 @@ namespace VRMate.Tests
             return Math.Min(delta, MaxDelta);
         }
 
-        /// <summary>全速の速さ（px/秒）= FootSpeed × px × sin(TurnDegrees°)。</summary>
+        /// <summary>倍率 1 のときの全速の速さ（px/秒）= FootSpeed × px × sin(TurnDegrees°)。</summary>
         private static double FullSpeed(float px)
         {
             return (double)WalkSequence.FootSpeed * px * Math.Sin((double)WalkSequence.TurnDegrees * Math.PI / 180.0);
+        }
+
+        /// <summary>倍率 k の歩きの全速の速さ（px/秒）= FootSpeed × k × px × sin(TurnDegrees°)。</summary>
+        private static double FullSpeed(float px, double k)
+        {
+            return FullSpeed(px) * k;
+        }
+
+        /// <summary>倍率 = MinSpeedScale + r × (MaxSpeedScale − MinSpeedScale)。</summary>
+        private static double ScaleFor(double r)
+        {
+            return (double)WalkSequence.MinSpeedScale + r * ((double)WalkSequence.MaxSpeedScale - (double)WalkSequence.MinSpeedScale);
+        }
+
+        /// <summary>止め始めてから止まるまでに全速で進む距離 = 全速 × FadeOut ÷ 2。</summary>
+        private static double StoppingDistance(float px, double k)
+        {
+            return FullSpeed(px, k) * (float)WalkSequence.FadeOut / 2.0;
         }
 
         private static double WaitFor(double r)
@@ -186,11 +206,14 @@ namespace VRMate.Tests
             public float PrevWeight;
             public float PrevTime;
             public bool PrevWalking;
+            public bool PrevHoldIdle;
+            public bool IdleAtBoundary;
             public float StepX;
             public float Weight;
             public float Time;
             public int Direction;
             public bool IsWalking;
+            public bool HoldIdle;
             public bool Started;
         }
 
@@ -217,6 +240,12 @@ namespace VRMate.Tests
             public bool CanWalk = true;
             public bool Talking;
             public IReadOnlyList<ScreenRect> MonitorList;
+
+            // 既定は自作の待機がないとき（いつも切れ目にある）と、待機に近い時刻の一覧がないとき（0 秒から始め、残りだけで止め始める）
+            public bool IdleAtBoundary = true;
+            public float ClipLength = 1f;
+            public float StartTime;
+            public IReadOnlyList<float> RestTimes;
 
             /// <summary>null でなければ体の矩形の代わりにこれを渡す（不正な矩形を渡すとき）。</summary>
             public ScreenRect? BodyOverride;
@@ -245,15 +274,18 @@ namespace VRMate.Tests
                     PrevWeight = Walk.Weight,
                     PrevTime = Walk.Time,
                     PrevWalking = Walk.IsWalking,
+                    PrevHoldIdle = Walk.HoldIdle,
+                    IdleAtBoundary = IdleAtBoundary,
                 };
 
-                Walk.Advance(delta, new WalkInput(CanWalk, Talking, PixelsPerMeter, log.Body, MonitorList));
+                Walk.Advance(delta, new WalkInput(CanWalk, Talking, PixelsPerMeter, log.Body, MonitorList, IdleAtBoundary, ClipLength, StartTime, RestTimes));
 
                 log.StepX = Walk.StepX;
                 log.Weight = Walk.Weight;
                 log.Time = Walk.Time;
                 log.Direction = Walk.Direction;
                 log.IsWalking = Walk.IsWalking;
+                log.HoldIdle = Walk.HoldIdle;
                 log.Started = Walk.IsWalking && !log.PrevWalking;
                 if (log.Started)
                 {
@@ -324,19 +356,20 @@ namespace VRMate.Tests
                 Assert.That(log.IsWalking, Is.False, because + "（" + i + " フレーム目に歩き出した）");
                 Assert.That(log.StepX, Is.EqualTo(0f), because + "（" + i + " フレーム目に動いた）");
                 Assert.That(log.Weight, Is.EqualTo(0f), because + "（" + i + " フレーム目に重みがある）");
+                Assert.That(log.HoldIdle, Is.False, because + "（" + i + " フレーム目に待機の押さえを求めた）");
             }
         }
 
         /// <summary>
-        /// 速さ = 向き × 全速 × 重み（今フレームの更新後）× 丸めた delta。ただし |StepX| は残り = min(D − 歩いた距離, 進む向きの隙間)（0 未満なら 0）を超えない。
+        /// 速さ = 向き × 倍率 × 全速 × 重み（今フレームの更新後）× 丸めた delta。ただし |StepX| は残り = min(D − 歩いた距離, 進む向きの隙間)（0 未満なら 0）を超えない。
         /// </summary>
-        private static void AssertSpeed(FrameLog log, ScreenRect monitor, double distance, string because)
+        private static void AssertSpeed(FrameLog log, ScreenRect monitor, double distance, double k, string because)
         {
-            var expected = log.Direction * FullSpeed(log.Px) * log.Weight * log.Delta;
+            var expected = log.Direction * FullSpeed(log.Px, k) * log.Weight * log.Delta;
             var remaining = Math.Max(0.0, Math.Min(distance - Math.Abs(log.WalkedBefore), Gap(log.Body, monitor, log.Direction)));
             if (Math.Abs(expected) < remaining - StepTolerance)
             {
-                Assert.That((double)log.StepX, Is.EqualTo(expected).Within(StepTolerance), because + "（向き × 0.5 × px × sin(90°) × 重み × delta）");
+                Assert.That((double)log.StepX, Is.EqualTo(expected).Within(StepTolerance), because + "（向き × 0.5 × k × px × sin(90°) × 重み × delta）");
                 return;
             }
 
@@ -366,6 +399,14 @@ namespace VRMate.Tests
         }
 
         [Test]
+        [Description("倍率の定数は計画の値（0.5〜0.75）である")]
+        public void SpeedScaleConstants_MatchThePlan()
+        {
+            Assert.That((double)WalkSequence.MinSpeedScale, Is.EqualTo(0.5));
+            Assert.That((double)WalkSequence.MaxSpeedScale, Is.EqualTo(0.75));
+        }
+
+        [Test]
         [Description("話し終えてから歩き出せるまでの秒は、待機の話し終えの保持（IdleSequence.TalkHoldSeconds）と同じ値である")]
         public void TalkHoldSeconds_EqualsIdleTalkHold()
         {
@@ -382,14 +423,15 @@ namespace VRMate.Tests
         }
 
         [Test]
-        [Description("歩きの入力は、コンストラクタで渡した値（歩ける・話している・1 m の px・体の矩形・モニターの一覧）をそのまま持つ")]
+        [Description("歩きの入力は、コンストラクタで渡した値（歩ける・話している・1 m の px・体の矩形・モニターの一覧・待機が切れ目にある・クリップの長さ・歩き出しの時刻・待機に近い時刻の一覧）をそのまま持つ")]
         public void WalkInput_KeepsEachValue()
         {
             var body = new ScreenRect(1.5f, -2.5f, 30.25f, 40.75f);
             var monitors = Monitors(Primary, RightOfPrimary);
+            var restTimes = new[] { 0.75f, 0.25f };
 
-            var input = new WalkInput(true, false, 123.4f, body, monitors);
-            var other = new WalkInput(false, true, -1f, body, null);
+            var input = new WalkInput(true, false, 123.4f, body, monitors, true, 1.25f, 0.375f, restTimes);
+            var other = new WalkInput(false, true, -1f, body, null, false, float.NaN, -2f, null);
 
             Assert.That(input.CanWalk, Is.True);
             Assert.That(input.Talking, Is.False);
@@ -403,10 +445,18 @@ namespace VRMate.Tests
             Assert.That(other.Talking, Is.True);
             Assert.That(other.PixelsPerMeter, Is.EqualTo(-1f));
             Assert.That(other.Monitors, Is.Null);
+            Assert.That(input.IdleAtBoundary, Is.True);
+            Assert.That(input.ClipLength, Is.EqualTo(1.25f));
+            Assert.That(input.StartTime, Is.EqualTo(0.375f));
+            Assert.That(input.RestTimes, Is.SameAs(restTimes));
+            Assert.That(other.IdleAtBoundary, Is.False);
+            Assert.That(other.ClipLength, Is.NaN);
+            Assert.That(other.StartTime, Is.EqualTo(-2f));
+            Assert.That(other.RestTimes, Is.Null);
         }
 
         [Test]
-        [Description("作った直後は歩いておらず、重み 0・横の移動 0・向きは右（+1）である")]
+        [Description("作った直後は歩いておらず、重み 0・横の移動 0・向きは右（+1）で、待機の押さえを求めない")]
         public void New_IsNotWalking_AndFacesRight()
         {
             var walk = new WalkSequence(Constant(0.0));
@@ -415,15 +465,16 @@ namespace VRMate.Tests
             Assert.That(walk.Weight, Is.EqualTo(0f));
             Assert.That(walk.StepX, Is.EqualTo(0f));
             Assert.That(walk.Direction, Is.EqualTo(1));
+            Assert.That(walk.HoldIdle, Is.False);
         }
 
         [Test]
-        [Description("出力は重み・向き・時刻・横の移動・歩いているか だけで、表示領域を縦に動かす出力を持たない")]
+        [Description("出力は重み・向き・時刻・横の移動・歩いているか・待機を押さえてほしいか だけで、表示領域を縦に動かす出力を持たない")]
         public void Outputs_HaveNoVerticalMovement()
         {
             var names = typeof(WalkSequence).GetProperties(BindingFlags.Public | BindingFlags.Instance).Select(p => p.Name).ToArray();
 
-            Assert.That(names, Is.EquivalentTo(new[] { "Weight", "Direction", "Time", "StepX", "IsWalking" }));
+            Assert.That(names, Is.EquivalentTo(new[] { "Weight", "Direction", "Time", "StepX", "IsWalking", "HoldIdle" }));
         }
 
         // ---- 待ち ----
@@ -559,6 +610,206 @@ namespace VRMate.Tests
                 Assert.That(log.Time, Is.EqualTo(time), "時刻が進んだ");
                 Assert.That(log.Direction, Is.EqualTo(direction));
                 Assert.That(log.IsWalking, Is.True, "歩きが終わった");
+            }
+        }
+
+        // ---- 待機の切れ目と押さえ ----
+
+        [Test]
+        [Description("待ちが終わっても待機が切れ目になければ歩き出さず、切れ目に来たフレームで歩き出す")]
+        public void Advance_StartsOnTheFrameIdleReachesBoundary_AfterTheWait()
+        {
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f) { IdleAtBoundary = false };
+            AssertNoWalk(rig.Run(20.0), "切れ目にない");
+
+            rig.IdleAtBoundary = true;
+            var log = rig.Step(Frame);
+
+            Assert.That(log.Started, Is.True, "切れ目に来たフレームで歩き出さない");
+        }
+
+        [Test]
+        [Description("待ちが終わる前に待機が切れ目にあっただけでは、待ちが終わったあと切れ目になければ歩き出さない")]
+        public void Advance_DoesNotStart_WhenIdleWasAtBoundaryOnlyBeforeTheWaitEnded()
+        {
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f) { IdleAtBoundary = true };
+            rig.Run(10.0);
+            rig.IdleAtBoundary = false;
+
+            AssertNoWalk(rig.Run(30.0), "待ちの途中だけ切れ目にあった");
+        }
+
+        [Test]
+        [Description("待ちが終わるまでは、待機の押さえを求めない")]
+        public void Advance_DoesNotHoldIdle_BeforeTheWaitEnds()
+        {
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f) { IdleAtBoundary = false };
+
+            var logs = rig.Run(15.0 - Slack);
+
+            Assert.That(logs.All(l => !l.HoldIdle), Is.True, "待ちの途中で押さえを求めた");
+        }
+
+        [Test]
+        [Description("待ちが終わって待機の切れ目を待つ間は、待機の押さえを求める")]
+        public void Advance_HoldsIdle_WhileWaitingForTheBoundaryAfterTheWait()
+        {
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f) { IdleAtBoundary = false };
+            rig.Run(15.0 + Slack);
+
+            var logs = rig.Run(10.0);
+
+            Assert.That(logs.All(l => l.HoldIdle && !l.IsWalking && l.Weight == 0f), Is.True, "切れ目を待つ間に押さえを求めない・歩き出した");
+        }
+
+        [Test]
+        [Description("待機が切れ目にないまま待ちにちょうど達したフレームから、待機の押さえを求める（1/16 秒ずつなら、15 秒の待ちは 240 フレーム目から）")]
+        public void Advance_HoldsIdle_FromTheFrameTheWaitIsExactlyReached()
+        {
+            // 1/16 秒は 2 進で割り切れるので、240 回足すとちょうど 15 秒になる
+            const float Sixteenth = 0.0625f;
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f) { IdleAtBoundary = false };
+
+            var logs = new List<FrameLog>();
+            for (var i = 0; i < 241; i++)
+            {
+                logs.Add(rig.Step(Sixteenth));
+            }
+
+            Assert.That(logs.Take(239).All(l => !l.HoldIdle), Is.True, "待ちが終わる前に押さえを求めた");
+            Assert.That(logs[239].HoldIdle, Is.True, "待ちにちょうど達したフレーム（240 フレーム目）で押さえを求めない");
+            Assert.That(logs[240].HoldIdle, Is.True, "待ちを過ぎたフレーム");
+            Assert.That(logs.All(l => !l.IsWalking), Is.True, "切れ目にないのに歩き出した");
+        }
+
+        // 重みが 0 のまま歩き出すのは、歩き出したフレームの delta が 0 のときと、進む向きの隙間が止まるまでの距離（18.75 px）以下で最初のフレームから止め始めるとき
+        [TestCase("歩き出したフレームの delta が 0")]
+        [TestCase("隙間が止まるまでの距離より小さい")]
+        [Description("歩き出したフレームは、重みが 0 のままでも待機の押さえを求める")]
+        public void Advance_HoldsIdle_OnTheStartFrame_EvenAtWeightZero(string kind)
+        {
+            FrameLog start;
+            if (kind == "歩き出したフレームの delta が 0")
+            {
+                var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f) { IdleAtBoundary = false };
+                rig.Run(15.0 + Slack);
+                rig.IdleAtBoundary = true;
+                start = rig.Step(0f);
+            }
+            else
+            {
+                // 幅 800 のモニターに幅 790 の体。隙間は左右とも 5 px で、右へ歩き出してすぐ止め始める
+                var rig = new Rig(Constant(0.0), Monitors(Small), 5f, 790f, 100f, 300f);
+                start = rig.StartWalk();
+            }
+
+            Assert.That(start.Started, Is.True, kind + ": 前提: このフレームで歩き出していない");
+            Assert.That(start.Weight, Is.EqualTo(0f), kind + ": 前提: 重みが 0 でない");
+            Assert.That(start.HoldIdle, Is.True, kind + ": 歩き出したフレームで押さえを求めない");
+        }
+
+        [Test]
+        [Description("歩きの重みが 0 より大きい間は、待機の押さえを求め、歩き終えて重みが 0 に戻ったフレームから求めない")]
+        public void Advance_HoldsIdle_WhileWeightIsPositive_AndReleasesWhenItReturnsToZero()
+        {
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f);
+            var start = rig.StartWalk();
+            var logs = rig.FinishWalk();
+            var after = rig.Run(5.0);
+
+            Assert.That(start.HoldIdle, Is.True, "歩き出したフレーム");
+            for (var i = 0; i < logs.Count; i++)
+            {
+                Assert.That(logs[i].HoldIdle, Is.EqualTo(logs[i].Weight > 0f), i + " フレーム目（重み " + logs[i].Weight + "）");
+            }
+
+            Assert.That(after.All(l => !l.HoldIdle), Is.True, "歩き終えたあとの待ちで押さえを求めた");
+        }
+
+        [TestCase("CanWalk が false")]
+        [TestCase("話し始め")]
+        [Description("歩いている間に歩き出せる状態が崩れても、重みを戻す間は待機の押さえを求め、重みが 0 に戻ったら求めない")]
+        public void Advance_HoldsIdle_WhileFadingOutAfterBreak(string kind)
+        {
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f);
+            rig.StartWalk();
+            rig.Run(0.5);
+            Break(rig, kind);
+
+            var logs = rig.RunUntil(l => l.Weight == 0f, 1.0);
+
+            Assert.That(logs, Is.Not.Null, "重みが 0 に戻らない");
+            for (var i = 0; i < logs.Count; i++)
+            {
+                Assert.That(logs[i].HoldIdle, Is.EqualTo(logs[i].Weight > 0f), kind + ": " + i + " フレーム目（重み " + logs[i].Weight + "）");
+            }
+        }
+
+        [TestCase("CanWalk が false")]
+        [TestCase("話し始め")]
+        [TestCase("モニターが null")]
+        [Description("待機の切れ目を待つ間に歩き出せる状態が崩れたら、そのフレームから押さえを求めず、待ちを始め直して待ち時間を引き直す")]
+        public void Advance_ReleasesHoldAndWaitsAgain_WhenStateBreaksWhileWaitingForTheBoundary(string kind)
+        {
+            // 最初の待ち 15 秒、引き直した待ち 30 秒
+            var random = new ScriptedRandom(0.0, 0.0, 1.0);
+            var rig = new Rig(random.Next, Monitors(Wide), 1870f, 100f) { IdleAtBoundary = false };
+            rig.Run(17.0);
+            Assert.That(rig.Walk.HoldIdle, Is.True, "前提: 切れ目を待っている");
+
+            Break(rig, kind);
+            var broken = rig.Step(Frame);
+            Assert.That(broken.HoldIdle, Is.False, kind + ": 崩れたフレームで押さえを求めた");
+
+            rig.CanWalk = true;
+            rig.Talking = false;
+            rig.MonitorList = Monitors(Wide);
+            rig.IdleAtBoundary = true;
+            var resumed = rig.Clock;
+            var waiting = rig.RunUntil(l => l.Started, 60.0);
+
+            Assert.That(waiting, Is.Not.Null, kind + ": 歩き出さない");
+            Assert.That(waiting.Take(waiting.Count - 1).All(l => !l.HoldIdle), Is.True, kind + ": 待ちを始め直す間に押さえを求めた");
+            var hold = kind == "話し始め" ? (double)WalkSequence.TalkHoldSeconds : 0.0;
+            Assert.That(rig.Clock - resumed, Is.InRange(hold + 30.0 - Slack, hold + 30.0 + Slack), kind + ": 引き直した待ち時間で歩き出していない");
+        }
+
+        [Test]
+        [Description("体の幅がモニターの幅以上で歩き出せなければ、待機が切れ目にあっても押さえを求めない")]
+        public void Advance_DoesNotHoldIdle_WhenTheWalkCannotStartAtTheBoundary()
+        {
+            var rig = new Rig(Constant(0.0), Monitors(Primary), 0f, 1920f);
+
+            AssertNeverStarts(rig, 70.0, "体の幅がモニターと同じ");
+        }
+
+        [Test]
+        [Description("待機が切れ目にあるかどうかが毎フレーム入れ替わっても、歩き出すのは待ちが終わったあとの切れ目にあるフレームだけである")]
+        public void Advance_StartsOnlyOnBoundaryFrames_WhenTheBoundaryFlickers()
+        {
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f);
+            var starts = 0;
+            for (var i = 0; i < 60 * 80; i++)
+            {
+                rig.IdleAtBoundary = i % 7 == 3;
+                var log = rig.Step(Frame);
+                if (log.Started)
+                {
+                    starts++;
+                    Assert.That(log.IdleAtBoundary, Is.True, i + " フレーム目: 切れ目にないフレームで歩き出した");
+                }
+            }
+
+            Assert.That(starts, Is.GreaterThanOrEqualTo(2), "歩き出した回数が少なすぎる");
+        }
+
+        private static void AssertNoWalk(List<FrameLog> logs, string because)
+        {
+            for (var i = 0; i < logs.Count; i++)
+            {
+                Assert.That(logs[i].IsWalking, Is.False, because + "（" + i + " フレーム目に歩き出した）");
+                Assert.That(logs[i].StepX, Is.EqualTo(0f), because + "（" + i + " フレーム目に動いた）");
+                Assert.That(logs[i].Weight, Is.EqualTo(0f), because + "（" + i + " フレーム目に重みがある）");
             }
         }
 
@@ -731,16 +982,33 @@ namespace VRMate.Tests
         }
 
         [Test]
-        [Description("歩き出すときは、先に距離の乱数を引き、次に向きの乱数を引く")]
-        public void Advance_DrawsDistanceBeforeDirection()
+        [Description("歩き出すときは、距離 → 向き → 倍率 の順に乱数を引く")]
+        public void Advance_DrawsDistanceThenDirectionThenSpeedScale()
         {
-            var random = new ScriptedRandom(0.0, 0.0, 0.5, 0.9);
+            var random = new ScriptedRandom(0.0, 0.0, 0.5, 0.9, 0.2);
             var rig = new Rig(random.Next, Monitors(Wide), 1870f, 100f);
             rig.StartWalk();
-            rig.FinishWalk();
+            var logs = rig.FinishWalk();
 
             Assert.That(rig.Walk.Direction, Is.EqualTo(1), "向きは 3 番目の乱数 0.9");
             Assert.That(rig.Walked, Is.InRange(700.0 - ArrivalTolerance(Px), 700.0 + StepTolerance), "距離は 2 番目の乱数 0.5 → 700 px");
+            AssertTimeRate(logs, ScaleFor(0.2), "倍率は 4 番目の乱数 0.2 → 0.55");
+        }
+
+        /// <summary>重みが正の間の各フレームで、時刻が 倍率 × 丸めた delta ずつ進むこと。</summary>
+        private static void AssertTimeRate(List<FrameLog> logs, double k, string because)
+        {
+            var checkedFrames = 0;
+            for (var i = 0; i < logs.Count; i++)
+            {
+                if (logs[i].PrevWeight > 0f || logs[i].Weight > 0f)
+                {
+                    Assert.That((double)logs[i].Time - logs[i].PrevTime, Is.EqualTo(k * logs[i].Delta).Within(WeightTolerance), because + "（" + i + " フレーム目）");
+                    checkedFrames++;
+                }
+            }
+
+            Assert.That(checkedFrames, Is.GreaterThan(10), because + "（確かめたフレームが少なすぎる）");
         }
 
         [TestCase(0.0, -1)]
@@ -775,19 +1043,20 @@ namespace VRMate.Tests
         }
 
         [Test]
-        [Description("片側だけが許されるときは向きの乱数を引かず、次の乱数は歩き終えたあとの待ち時間に使う")]
+        [Description("片側だけが許されるときは向きの乱数を引かず、距離の次の乱数を倍率に、その次を歩き終えたあとの待ち時間に使う")]
         public void Advance_DoesNotDrawDirection_WhenOnlyOneSideHasRoom()
         {
-            // 待ち 15 秒 → 距離 400 px → 次の待ち 0.8 → 27 秒
-            var random = new ScriptedRandom(0.0, 0.0, 0.0, 0.8);
+            // 待ち 15 秒 → 距離 400 px → 倍率 0.3 → 0.575 → 次の待ち 0.8 → 27 秒
+            var random = new ScriptedRandom(0.0, 0.0, 0.0, 0.3, 0.8);
             var rig = new Rig(random.Next, Monitors(Primary), 300f, 100f);
             rig.StartWalk();
-            rig.FinishWalk();
+            var logs = rig.FinishWalk();
             var ended = rig.Clock;
 
             rig.StartWalk(60.0);
 
-            Assert.That(rig.Clock - ended, Is.InRange(27.0 - Slack, 27.0 + Slack));
+            AssertTimeRate(logs, ScaleFor(0.3), "倍率");
+            Assert.That(rig.Clock - ended, Is.InRange(27.0 - Slack, 27.0 + Slack), "次の待ち時間");
         }
 
         [TestCase(390f, -1)]
@@ -835,7 +1104,7 @@ namespace VRMate.Tests
         [TestCase(double.NegativeInfinity, 0.0)]
         [TestCase(5.0, 1.0)]
         [TestCase(double.PositiveInfinity, 1.0)]
-        [Description("乱数が NaN なら 0、[0, 1] の外なら近い方の端に丸めて、待ち時間・距離・向きを決める")]
+        [Description("乱数が NaN なら 0、[0, 1] の外なら近い方の端に丸めて、待ち時間・距離・向き・倍率を決める")]
         public void Advance_ClampsRandom(double r, double clamped)
         {
             var rig = new Rig(Constant(r), Monitors(Wide), 1870f, 100f);
@@ -843,8 +1112,42 @@ namespace VRMate.Tests
             var start = rig.StartWalk(60.0);
             Assert.That(rig.Clock, Is.InRange(WaitFor(clamped) - Slack, WaitFor(clamped) + Slack), "待ち時間");
             Assert.That(start.Direction, Is.EqualTo(clamped < 0.5 ? -1 : 1), "向き");
-            rig.FinishWalk();
+            var logs = rig.FinishWalk();
             Assert.That(Math.Abs(rig.Walked), Is.InRange(DistanceFor(clamped) - ArrivalTolerance(Px), DistanceFor(clamped) + StepTolerance), "距離");
+            AssertTimeRate(logs, ScaleFor(clamped), "倍率");
+        }
+
+        // ---- 倍率 ----
+
+        [TestCase(0.0)]
+        [TestCase(0.37)]
+        [TestCase(0.999999)]
+        [Description("倍率は歩き出すときの乱数 r から 0.5 + r × (0.75 − 0.5) で決まり、その歩きの間ずっと時刻は 1 秒に倍率の秒ずつ進む")]
+        public void Advance_AdvancesTimeBySpeedScale_DrawnFromRandom(double r)
+        {
+            var rig = new Rig(Constant(r), Monitors(Wide), 1870f, 100f);
+            rig.StartWalk(60.0);
+
+            var logs = rig.FinishWalk();
+
+            AssertTimeRate(logs, ScaleFor(r), "r = " + r);
+        }
+
+        [Test]
+        [Description("倍率は歩きごとに選び直す")]
+        public void Advance_DrawsSpeedScaleAgainForEachWalk()
+        {
+            // 1 回目: 待ち 0 → 距離 0 → 向き 0（左）→ 倍率 0。2 回目: 待ち 0 → 距離 0 → 向き 0.9（右）→ 倍率 1
+            var random = new ScriptedRandom(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9, 1.0);
+            var rig = new Rig(random.Next, Monitors(Wide), 1870f, 100f);
+            rig.StartWalk();
+            var first = rig.FinishWalk();
+
+            rig.StartWalk();
+            var second = rig.FinishWalk();
+
+            AssertTimeRate(first, (double)WalkSequence.MinSpeedScale, "1 回目");
+            AssertTimeRate(second, (double)WalkSequence.MaxSpeedScale, "2 回目");
         }
 
         // ---- 歩く間 ----
@@ -871,20 +1174,21 @@ namespace VRMate.Tests
         [TestCase("1/144 秒・123.4 px")]
         [TestCase("1/30 秒・px が毎フレーム変わる")]
         [TestCase("1/15 秒を超えるフレームを含む")]
-        [Description("歩いている間の横の移動は、どのフレームでも 向き × 0.5 × 1 m の px × sin(90°) × 重み × 丸めた delta に等しい（残りで押さえられるフレームを除く）")]
-        public void Advance_MovesAtFootSpeedTimesPixelsPerMeterTimesWeight(string pattern)
+        [Description("歩いている間の横の移動は、どのフレームでも 向き × 0.5 × 倍率 × 1 m の px × sin(90°) × 重み × 丸めた delta に等しい（残りで押さえられるフレームを除く）")]
+        public void Advance_MovesAtFootSpeedTimesScaleTimesPixelsPerMeterTimesWeight(string pattern)
         {
             var rig = new Rig(Constant(0.99), Monitors(Wide), 1800f, 100f);
             rig.PixelsPerMeter = PatternPx(pattern, 0);
             rig.StartWalk(40.0, PatternDelta(pattern, 0));
             var distance = DistanceFor(0.99);
+            var k = ScaleFor(0.99);
 
             var frames = 0;
             for (var i = 1; i < 100000 && rig.Walk.Weight > 0f; i++)
             {
                 rig.PixelsPerMeter = PatternPx(pattern, i);
                 var log = rig.Step(PatternDelta(pattern, i));
-                AssertSpeed(log, Wide, distance, pattern + " の " + i + " フレーム目");
+                AssertSpeed(log, Wide, distance, k, pattern + " の " + i + " フレーム目");
                 frames++;
             }
 
@@ -923,15 +1227,15 @@ namespace VRMate.Tests
         }
 
         [Test]
-        [Description("残りが 全速 × 0.3 ÷ 2 以下になったら、重みは 1 フレームごとに delta ÷ 0.3 ずつ下がって 0 になり、その間も動く")]
+        [Description("待機に近い時刻の一覧がないとき、残りが 全速（倍率込み）× 0.3 ÷ 2 以下になったら、重みは 1 フレームごとに delta ÷ 0.3 ずつ下がって 0 になり、その間も動く")]
         public void Advance_LowersWeightOverFadeOut_WhenRemainingReachesHalfFadeOutDistance()
         {
             var rig = new Rig(Constant(0.99), Monitors(Wide), 1800f, 100f);
             rig.StartWalk();
             var logs = rig.FinishWalk();
             var distance = DistanceFor(0.99);
-            var threshold = FullSpeed(Px) * (float)WalkSequence.FadeOut / 2.0;
-            var oneFrame = FullSpeed(Px) * Frame * 1.01;
+            var threshold = StoppingDistance(Px, ScaleFor(0.99));
+            var oneFrame = FullSpeed(Px, ScaleFor(0.99)) * Frame * 1.01;
 
             var endFrame = logs.FindIndex(l => l.Weight < l.PrevWeight);
             Assert.That(endFrame, Is.GreaterThan(0), "重みが下がらない");
@@ -959,22 +1263,241 @@ namespace VRMate.Tests
         }
 
         [Test]
-        [Description("時刻は歩き始めから丸めた delta ずつ進み、次の歩きでは 0 から数え直す")]
-        public void Advance_AdvancesTimeFromWalkStart()
+        [Description("時刻は歩き出しの時刻から 倍率 × 丸めた delta ずつ進み、クリップの長さを越えても剰余を取らず、次の歩きではそのときの歩き出しの時刻から始まる")]
+        public void Advance_AdvancesTimeFromStartTime()
         {
-            var rig = new Rig(Constant(0.99), Monitors(Wide), 1800f, 100f);
+            var k = ScaleFor(0.99);
+            var rig = new Rig(Constant(0.99), Monitors(Wide), 1800f, 100f) { ClipLength = 1.2f, StartTime = 0.4f, RestTimes = new[] { 0.4f } };
             var first = rig.StartWalk();
-            Assert.That(first.Time, Is.InRange(0f, first.Delta + WeightTolerance), "歩き出したフレーム");
+            Assert.That((double)first.Time, Is.InRange(0.4, 0.4 + k * first.Delta + WeightTolerance), "歩き出したフレーム");
 
             var logs = rig.FinishWalk();
-            foreach (var log in logs)
-            {
-                Assert.That(log.Time - log.PrevTime, Is.EqualTo(log.Delta).Within(WeightTolerance));
-            }
+            AssertTimeRate(logs, k, "1 回目");
+            Assert.That(logs.Max(l => l.Time), Is.GreaterThan(2f * rig.ClipLength), "クリップの長さで剰余を取った");
 
             rig.X = 1800.0;
+            rig.StartTime = 0.9f;
             var second = rig.StartWalk();
-            Assert.That(second.Time, Is.InRange(0f, second.Delta + WeightTolerance), "次の歩きの始まり");
+            Assert.That((double)second.Time, Is.InRange(0.9, 0.9 + k * second.Delta + WeightTolerance), "次の歩きの始まり");
+        }
+
+        // ClipLength 1 で 0.6 を歩き出しの時刻に、0.1 と 0.5 を待機に近い時刻にして、どれか 1 つを不正にする。
+        // 一覧を使えば、0.5 を越えたフレーム（残り約 41 px）で止め始めるので、残りだけの規則（18.75 px）と区別できる
+        [TestCase("クリップの長さが 0", 0f, 0.6f, "有効")]
+        [TestCase("クリップの長さが負", -1f, 0.6f, "有効")]
+        [TestCase("クリップの長さが NaN", float.NaN, 0.6f, "有効")]
+        [TestCase("クリップの長さが無限", float.PositiveInfinity, 0.6f, "有効")]
+        [TestCase("歩き出しの時刻が NaN", 1f, float.NaN, "有効")]
+        [TestCase("歩き出しの時刻が負", 1f, -0.1f, "有効")]
+        [TestCase("歩き出しの時刻がクリップの長さと同じ", 1f, 1f, "有効")]
+        [TestCase("歩き出しの時刻がクリップの長さより大きい", 1f, 1.6f, "有効")]
+        [TestCase("待機に近い時刻の一覧が null", 1f, 0.6f, "null")]
+        [TestCase("待機に近い時刻の一覧が空", 1f, 0.6f, "空")]
+        [Description("クリップの長さ・歩き出しの時刻・待機に近い時刻の一覧のどれかが不正なら、時刻は 0 から始まり、残りが 全速 × 0.3 ÷ 2 以下になったフレームで止め始める")]
+        public void Advance_StartsAtZeroAndStopsByRemaining_WhenClipInputsAreInvalid(string label, float clipLength, float startTime, string restKind)
+        {
+            // 待ち 15 秒・距離 400 px・左・倍率 0.5
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f)
+            {
+                ClipLength = clipLength,
+                StartTime = startTime,
+                RestTimes = restKind == "null" ? null : (restKind == "空" ? new float[0] : new[] { 0.1f, 0.5f }),
+            };
+
+            var start = rig.StartWalk();
+            var logs = rig.FinishWalk();
+
+            Assert.That((double)start.Time, Is.InRange(0.0, 0.5 * start.Delta + WeightTolerance), label + ": 歩き出したフレームの時刻");
+            AssertEndsByRemaining(logs, DistanceFor(0.0), 0.5, label);
+        }
+
+        /// <summary>止め始めたフレームが、残りが 全速 × 0.3 ÷ 2 を 1 フレーム分の誤差で切ったフレームであること。</summary>
+        private static void AssertEndsByRemaining(List<FrameLog> logs, double distance, double k, string because)
+        {
+            var threshold = StoppingDistance(Px, k);
+            var oneFrame = FullSpeed(Px, k) * Frame * 1.01;
+            var endFrame = logs.FindIndex(l => l.Weight < l.PrevWeight);
+            Assert.That(endFrame, Is.GreaterThan(0), because + ": 重みが下がらない");
+            for (var i = 0; i < endFrame; i++)
+            {
+                var remaining = distance - Math.Abs(logs[i].WalkedBefore);
+                Assert.That(remaining, Is.GreaterThan(threshold - oneFrame), because + ": " + i + " フレーム目で残りが閾値を過ぎても止め始めない");
+            }
+
+            var entered = distance - Math.Abs(logs[endFrame].WalkedBefore);
+            Assert.That(entered, Is.LessThanOrEqualTo(threshold + oneFrame), because + ": 残り " + entered.ToString("F2") + " px で止め始めた（閾値 " + threshold + " px）");
+        }
+
+        // ---- 待機に近い時刻で止め始める ----
+
+        // ClipLength 1・倍率 0.5（クリップは 1 秒に 0.5 秒進む）・全速 125 px/秒・距離 493.75 px・止まるまでの距離 18.75 px。
+        // 待機に近い時刻 0.2 と 0.5 は間が 0.3 と 0.7 で非対称。0.2 から歩き出すと、時刻 0.5（約 0.6 秒）・1.2（2.0 秒）・1.5（2.6 秒）で越える。
+        //   0.5 を越えたとき: 残り約 433 > 次（1.2）までの 0.7 × 250 + 18.75 = 193.75 → 続ける
+        //   1.2 を越えたとき: 残り約 259 > 次（1.5）までの 0.3 × 250 + 18.75 = 93.75 → 続ける
+        //   1.5 を越えたとき: 残り約 185 は、次（2.2）までの 175 より大きく、止まるまでの距離を足した 193.75 より小さい → 止め始める
+        // 和でなく次までの距離だけで比べると 1.5 では続け、残りが 18.75 px になる時刻 2.16 ごろ（待機に近い時刻ではない）で止め始める
+        [TestCase("小さい順", new[] { 0.2f, 0.5f })]
+        [TestCase("並びが乱れている", new[] { 0.5f, 0.2f })]
+        [TestCase("NaN・負・クリップの長さ以上を含む", new[] { 1.3f, 0.2f, float.NaN, -0.4f, 0.5f, 7f })]
+        [Description("自然に終わるときは、時刻が待機に近い時刻を越えたフレームで、次の待機に近い時刻まで進む距離と止まるまでの距離の和が残りより大きければ、次までの距離だけなら残りに届かなくても、そこで重みを下げ始める")]
+        public void Advance_StartsSlowingDownAtRestTime_WhenTheNextRestTimeIsOutOfReach(string label, float[] restTimes)
+        {
+            // 待ち 15 秒・距離 400 + 0.15625 × 600 = 493.75 px・左・倍率 0.5
+            const double DistanceRandom = 0.15625;
+            var random = new ScriptedRandom(0.0, 0.0, DistanceRandom, 0.0, 0.0);
+            var rig = new Rig(random.Next, Monitors(Wide), 1870f, 100f) { ClipLength = 1f, StartTime = 0.2f, RestTimes = restTimes };
+            var start = rig.StartWalk();
+            var logs = rig.FinishWalk();
+
+            Assert.That((double)start.Time, Is.InRange(0.2, 0.2 + 0.5 * start.Delta + WeightTolerance), label + ": 歩き出しの時刻");
+            var endFrame = logs.FindIndex(l => l.Weight < l.PrevWeight);
+            Assert.That(endFrame, Is.GreaterThan(0), label + ": 重みが下がらない");
+            Assert.That((double)logs[endFrame].Time, Is.InRange(1.5 - WeightTolerance, 1.5 + 2.0 * 0.5 * Frame + WeightTolerance), label + ": 止め始めた時刻が 1.5（待機に近い時刻 0.5）を越えたフレームでない");
+            var remaining = DistanceFor(DistanceRandom) - Math.Abs(logs[endFrame].WalkedBefore);
+            Assert.That(remaining, Is.InRange(0.7 * FullSpeed(Px) + StepTolerance, 0.7 * FullSpeed(Px) + StoppingDistance(Px, 0.5)), label + ": 止め始めたときの残りが、次までの距離 175 px と、止まるまでの距離との和 193.75 px の間にない");
+            Assert.That(Math.Abs(rig.Walked), Is.LessThanOrEqualTo(DistanceFor(DistanceRandom) + StepTolerance), label + ": 距離を超えた");
+            Assert.That(Math.Abs(rig.Walked), Is.InRange(320.0, 340.0), label + ": 止まった位置が 1.5 から止まるまでの距離（約 309 + 18.75 px）にない");
+        }
+
+        // ClipLength 1・待機に近い時刻 0.2 と 0.7（間はどちらも 0.5、次までの距離 0.5 × 250 = 125 px）・倍率 0.5・距離 493.75 px。
+        // 0.2 から歩き出すと、時刻 0.7（1 秒）・1.2（2 秒）・1.7（3 秒）で越え、そのときの残りは約 384・259・135 px。
+        // 1.7 での残り約 135 は 125 < 残り ≤ 125 + 18.75 に入るので、そこで止め始める
+        [Test]
+        [Description("越えたときの残りが、次の待機に近い時刻まで進む距離より大きく、止まるまでの距離との和以下なら、その待機に近い時刻で止め始め、止まる位置は狙った位置を越えず、次までの距離と止まるまでの距離の和より手前にはならない")]
+        public void Advance_StartsSlowingDownAtRestTime_WhenOnlyTheStoppingDistanceIsOutOfReach()
+        {
+            const double DistanceRandom = 0.15625;
+            var random = new ScriptedRandom(0.0, 0.0, DistanceRandom, 0.0, 0.0);
+            var rig = new Rig(random.Next, Monitors(Wide), 1870f, 100f) { ClipLength = 1f, StartTime = 0.2f, RestTimes = new[] { 0.2f, 0.7f } };
+            rig.StartWalk();
+            var logs = rig.FinishWalk();
+
+            var distance = DistanceFor(DistanceRandom);
+            var toNext = 0.5 * FullSpeed(Px);
+            var stopping = StoppingDistance(Px, 0.5);
+            var endFrame = logs.FindIndex(l => l.Weight < l.PrevWeight);
+            Assert.That(endFrame, Is.GreaterThan(0), "重みが下がらない");
+            var crossed = 1.0 + (double)0.7f;
+            var end = logs[endFrame];
+            Assert.That(end.PrevTime < crossed && end.Time >= crossed, Is.True, "止め始めたのが 1.7（待機に近い時刻 0.7）を越えたフレームでない（" + end.PrevTime + " → " + end.Time + "）");
+            var remaining = distance - Math.Abs(end.WalkedBefore);
+            Assert.That(remaining, Is.InRange(toNext + StepTolerance, toNext + stopping), "止め始めたときの残りが、次までの距離 125 px と、止まるまでの距離との和 143.75 px の間にない");
+            Assert.That(Math.Abs(rig.Walked), Is.LessThanOrEqualTo(distance + StepTolerance), "狙った位置を越えた");
+            Assert.That(Math.Abs(rig.Walked), Is.GreaterThanOrEqualTo(distance - (toNext + stopping)), "狙った位置より、次までの距離と止まるまでの距離の和を超えて手前で止まった");
+        }
+
+        // ClipLength 2・待機に近い時刻 0.2 と 0.205・倍率 0.5・全速 250 px/秒。0.2 から歩き出すと、最初のフレーム（時刻 0.2 → 約 0.208）で 0.205 を越え、
+        // 次は 2.2 なので、比べる和は (2.2 − 0.205) × 250 + 止まるまでの距離 ≈ 517.5 px。最初のフレームの残りは距離そのものなので、
+        // 距離の乱数を選んで、残りを和とちょうど等しく（double で一致）、または 1 ulp だけ小さくする
+        [TestCase("残りが和とちょうど等しい", 0, false)]
+        [TestCase("残りが和より 1 ulp 小さい", -1, true)]
+        [Description("越えたときの次の待機に近い時刻まで進む距離と止まるまでの距離の和が残りとちょうど等しければ止め始めず、残りが和より小さければそのフレームで止め始める")]
+        public void Advance_StartsSlowingDownAtRestTime_OnlyWhenTheSumIsGreaterThanRemaining(string label, int ulps, bool slowsDown)
+        {
+            var sum = (((double)2f + (double)0.2f) - (double)0.205f) * FullSpeed(Px) + StoppingDistance(Px, 0.5);
+            var target = Offset(sum, ulps);
+            var distanceRandom = DistanceRandomFor(target);
+            var random = new ScriptedRandom(0.0, 0.0, distanceRandom, 0.0, 0.0);
+            var rig = new Rig(random.Next, Monitors(Wide), 1870f, 100f) { ClipLength = 2f, StartTime = 0.2f, RestTimes = new[] { 0.2f, 0.205f } };
+
+            var start = rig.StartWalk();
+
+            Assert.That((double)start.PrevTime, Is.LessThan((double)0.205f), label + ": 前提: 歩き出したフレームの前の時刻が 0.205 より前でない");
+            Assert.That((double)start.Time, Is.GreaterThanOrEqualTo((double)0.205f), label + ": 前提: 歩き出したフレームで 0.205 を越えていない");
+            if (slowsDown)
+            {
+                Assert.That(start.Weight, Is.EqualTo(0f), label + ": 和が残りより大きいのに止め始めない");
+                Assert.That(rig.Step(Frame).IsWalking, Is.False, label + ": 止め始めた次のフレームで歩きが終わらない");
+            }
+            else
+            {
+                Assert.That(start.Weight, Is.GreaterThan(0f), label + ": 和が残りと等しいのに止め始めた");
+                Assert.That(rig.Run(1.0).All(l => l.IsWalking && l.Weight >= l.PrevWeight), Is.True, label + ": 次の 1 秒の間に止め始めた");
+            }
+        }
+
+        /// <summary>value から ulps（負なら小さい方へ）だけ隣の double。value は正。</summary>
+        private static double Offset(double value, int ulps)
+        {
+            return BitConverter.Int64BitsToDouble(BitConverter.DoubleToInt64Bits(value) + ulps);
+        }
+
+        /// <summary>距離 = MinDistance + r × (MaxDistance − MinDistance) が double で distance とちょうど等しくなる r。</summary>
+        private static double DistanceRandomFor(double distance)
+        {
+            var estimate = (distance - (double)WalkSequence.MinDistance) / ((double)WalkSequence.MaxDistance - (double)WalkSequence.MinDistance);
+            for (var i = 0; i <= 64; i++)
+            {
+                foreach (var candidate in new[] { Offset(estimate, i), Offset(estimate, -i) })
+                {
+                    if (DistanceFor(candidate) == distance)
+                    {
+                        return candidate;
+                    }
+                }
+            }
+
+            Assert.Fail("距離 " + distance.ToString("R") + " にちょうどなる乱数が見つからない");
+            return double.NaN;
+        }
+
+        // ClipLength 1・待機に近い時刻 0.99 だけ・歩き出しの時刻 0.01・倍率 0.5・距離 400 px。1/15 秒ずつ進めると時刻は 1 フレームに 1/30 進み、
+        // 0.9767 → 1.01 のフレームで 0.99 と周期の境目 1.0 を同時に越える。そのときの残り約 166 < 1 周先までの 250 + 18.75 → 止め始める
+        [Test]
+        [Description("1 フレームで待機に近い時刻とクリップの周期の境目を同時に越えても、そのフレームで止め始めを判定する")]
+        public void Advance_StartsSlowingDownAtRestTime_WhenTheFrameAlsoCrossesTheClipLength()
+        {
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f) { ClipLength = 1f, StartTime = 0.01f, RestTimes = new[] { 0.99f } };
+            rig.StartWalk(40.0, MaxDelta);
+            var logs = rig.FinishWalk(60.0, MaxDelta);
+
+            var endFrame = logs.FindIndex(l => l.Weight < l.PrevWeight);
+            Assert.That(endFrame, Is.GreaterThan(0), "重みが下がらない");
+            var end = logs[endFrame];
+            Assert.That(end.PrevTime < (double)0.99f && end.Time >= 1.0, Is.True, "止め始めたのが 0.99 と 1.0 を同時に越えたフレームでない（" + end.PrevTime + " → " + end.Time + "）");
+            Assert.That(Math.Abs(rig.Walked), Is.LessThanOrEqualTo(DistanceFor(0.0) + StepTolerance), "距離を超えた");
+        }
+
+        [Test]
+        [Description("待機に近い時刻が 1 つだけなら、越えたときの次はクリップ 1 周先の同じ時刻として比べる")]
+        public void Advance_UsesOnePeriodAhead_WhenThereIsOnlyOneRestTime()
+        {
+            // 0.3 から歩き出し、1.3（2.0 秒）で越える。残り約 166 < 1 周 1.0 × 250 + 18.75 = 268.75 → 止め始める
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f) { ClipLength = 1f, StartTime = 0.3f, RestTimes = new[] { 0.3f } };
+            rig.StartWalk();
+            var logs = rig.FinishWalk();
+
+            var endFrame = logs.FindIndex(l => l.Weight < l.PrevWeight);
+            Assert.That(endFrame, Is.GreaterThan(0), "重みが下がらない");
+            Assert.That((double)logs[endFrame].Time, Is.InRange(1.3 - WeightTolerance, 1.3 + 2.0 * 0.5 * Frame + WeightTolerance), "止め始めた時刻が 1.3 を越えたフレームでない");
+        }
+
+        [Test]
+        [Description("歩いている間にどの待機に近い時刻も越えないうちに残りが少なくなれば、残りが 全速 × 0.3 ÷ 2 以下になったフレームで止め始める")]
+        public void Advance_StopsByRemaining_WhenNoRestTimeIsCrossedBeforeTheEnd()
+        {
+            // クリップ 10 秒・待機に近い時刻 0.3 だけ。次に越えるのは 20 秒後で、400 px は約 3.3 秒で歩き終える
+            var rig = new Rig(Constant(0.0), Monitors(Wide), 1870f, 100f) { ClipLength = 10f, StartTime = 0.3f, RestTimes = new[] { 0.3f } };
+            rig.StartWalk();
+            var logs = rig.FinishWalk();
+
+            AssertEndsByRemaining(logs, DistanceFor(0.0), 0.5, "越えない");
+        }
+
+        [Test]
+        [Description("待機に近い時刻で止め始めても、体の進む向きの端は歩き始めたモニターの端を越えない")]
+        public void Advance_StaysInsideMonitor_WhenSlowingDownAtRestTimeNearTheEdge()
+        {
+            // 幅 800 のモニターに幅 100 の体。隙間は左 300・右 400、距離 400 → 右へ。待機に近い時刻は 0.2 と 0.5
+            var rig = new Rig(Constant(0.0), Monitors(Small), 300f, 100f, 100f, 300f) { ClipLength = 1f, StartTime = 0.2f, RestTimes = new[] { 0.2f, 0.5f } };
+            var start = rig.StartWalk();
+            var logs = rig.FinishWalk();
+
+            Assert.That(start.Direction, Is.EqualTo(1));
+            foreach (var log in logs)
+            {
+                Assert.That((double)log.Body.X + log.Body.Width + log.StepX, Is.LessThanOrEqualTo(800.0 + EdgeTolerance), "右端を越えた");
+            }
         }
 
         [Test]
@@ -1187,7 +1710,7 @@ namespace VRMate.Tests
         [Description("左右の隙間がどちらも終わりに入る残り（全速 × 0.3 ÷ 2）より小さくても、歩き出したフレームは歩いていることになり、そのあと端を越えずに歩き終える")]
         public void Advance_StartsWalkingAndStaysInside_WhenGapsAreShorterThanEndingLength()
         {
-            // 幅 800 のモニターに幅 780 の体。隙間は左右とも 10 px（終わりに入る残り 37.5 px より小さい）→ 右
+            // 幅 800 のモニターに幅 780 の体。隙間は左右とも 10 px（倍率 0.5 で終わりに入る残り 18.75 px より小さい）→ 右
             var rig = new Rig(Constant(0.0), Monitors(Small), 10f, 780f, 100f, 300f);
             var start = rig.StartWalk();
             var logs = rig.FinishWalk();
@@ -1202,7 +1725,7 @@ namespace VRMate.Tests
         [Description("進む向きの隙間が終わりに入る残り（全速 × 0.3 ÷ 2）より大きく距離より小さければ、隙間の分だけ動いて端で止まる")]
         public void Advance_MovesTheWholeGapAndStopsAtEdge_WhenGapIsBetweenEndingLengthAndDistance()
         {
-            // 幅 800 のモニターに幅 600 の体。隙間は左右とも 100 px（37.5 < 100 < 距離 400）→ 右
+            // 幅 800 のモニターに幅 600 の体。隙間は左右とも 100 px（18.75 < 100 < 距離 400）→ 右
             var rig = new Rig(Constant(0.0), Monitors(Small), 100f, 600f, 100f, 300f);
             var start = rig.StartWalk();
             var logs = rig.FinishWalk();
@@ -1309,7 +1832,7 @@ namespace VRMate.Tests
         }
 
         [Test]
-        [Description("条件が崩れて重みを戻す間も、時刻は丸めた delta ずつ進む")]
+        [Description("条件が崩れて重みを戻す間も、時刻は 倍率 × 丸めた delta ずつ進む")]
         public void Advance_AdvancesTime_WhileFadingOutAfterBreak()
         {
             var rig = new Rig(Constant(0.99), Monitors(Wide), 1800f, 100f);
@@ -1322,7 +1845,7 @@ namespace VRMate.Tests
             Assert.That(logs, Is.Not.Null);
             foreach (var log in logs)
             {
-                Assert.That(log.Time - log.PrevTime, Is.EqualTo(log.Delta).Within(WeightTolerance));
+                Assert.That((double)log.Time - log.PrevTime, Is.EqualTo(ScaleFor(0.99) * log.Delta).Within(WeightTolerance));
             }
         }
 
@@ -1338,7 +1861,7 @@ namespace VRMate.Tests
         [TestCase("狭いモニター・両側の隙間がわずか")]
         [TestCase("不正なモニターを含む")]
         [TestCase("体がモニターより広い")]
-        [Description("モニターの並び・歩き始めの位置・体の大きさ・出来事・フレームの長さ・乱数を変えて長く動かしても、動くのは重みが正で歩いている間だけで、動いたあとの体の進む向きの端は歩き始めたモニターの端を越えない")]
+        [Description("モニターの並び・歩き始めの位置・体の大きさ・出来事・フレームの長さ・乱数・待機の切れ目・クリップの時刻の入力を変えて長く動かしても、動くのは重みが正で歩いている間だけで、動いたあとの体の進む向きの端は歩き始めたモニターの端を越えず、歩き出すのは待機が切れ目にあるフレームだけで、重みが正の間は待機の押さえを求める")]
         public void Advance_KeepsInvariants_OverLongRandomRuns(string layout)
         {
             var totals = new Totals();
@@ -1350,6 +1873,9 @@ namespace VRMate.Tests
             Assert.That(totals.Walks, Is.GreaterThanOrEqualTo(3), layout + ": 歩き出した回数が少なすぎて確かめになっていない");
             Assert.That(totals.MovingFrames, Is.GreaterThanOrEqualTo(100), layout + ": 動いたフレームが少なすぎる");
             Assert.That(totals.BrokenFrames, Is.GreaterThan(0), layout + ": 状態が崩れたフレームを通っていない");
+            Assert.That(totals.BoundaryWaitFrames, Is.GreaterThan(0), layout + ": 切れ目を待つフレームを通っていない");
+            Assert.That(totals.WalksFromStartTime, Is.GreaterThan(0), layout + ": 歩き出しの時刻から始まる歩きを通っていない");
+            Assert.That(totals.WalksFromZero, Is.GreaterThan(0), layout + ": 不正な入力で 0 から始まる歩きを通っていない");
             if (layout == "狭いモニター・両側の隙間がわずか")
             {
                 Assert.That(totals.EdgeArrivals, Is.GreaterThan(0), layout + ": 端に着いたフレームを通っていない");
@@ -1362,6 +1888,72 @@ namespace VRMate.Tests
             public int MovingFrames;
             public int EdgeArrivals;
             public int BrokenFrames;
+            public int BoundaryWaitFrames;
+            public int WalksFromStartTime;
+            public int WalksFromZero;
+        }
+
+        /// <summary>クリップの長さ・歩き出しの時刻・待機に近い時刻の一覧の組。Valid は、時刻を歩き出しの時刻から始めるべき組かどうか。</summary>
+        private sealed class ClipInputs
+        {
+            public float Length;
+            public float Start;
+            public float[] Rests;
+            public bool Valid;
+        }
+
+        /// <summary>
+        /// ほとんどは正しい組（並びの乱れ・NaN・範囲外の値を混ぜた一覧を含む）。ときどきクリップの長さ・歩き出しの時刻・一覧のどれかが不正な組。
+        /// 一覧に正しい値が 1 つもない組は作らない（その扱いは計画が決めていない）。
+        /// </summary>
+        private static ClipInputs NoisyClipInputs(Random random)
+        {
+            var length = 0.4f + (float)random.NextDouble() * 3f;
+            var count = 1 + random.Next(4);
+            var rests = new List<float>();
+            for (var i = 0; i < count; i++)
+            {
+                rests.Add((float)random.NextDouble() * length * 0.999f);
+            }
+
+            if (random.Next(3) == 0)
+            {
+                rests.Insert(random.Next(rests.Count + 1), float.NaN);
+                rests.Insert(random.Next(rests.Count + 1), -0.25f);
+                rests.Insert(random.Next(rests.Count + 1), length + 0.5f);
+            }
+
+            var start = rests.Where(r => r >= 0f && r < length).First();
+            var inputs = new ClipInputs { Length = length, Start = start, Rests = rests.ToArray(), Valid = true };
+            switch (random.Next(12))
+            {
+                case 0:
+                    inputs.Length = float.NaN;
+                    inputs.Valid = false;
+                    break;
+                case 1:
+                    inputs.Length = 0f;
+                    inputs.Valid = false;
+                    break;
+                case 2:
+                    inputs.Start = length;
+                    inputs.Valid = false;
+                    break;
+                case 3:
+                    inputs.Start = float.NaN;
+                    inputs.Valid = false;
+                    break;
+                case 4:
+                    inputs.Rests = null;
+                    inputs.Valid = false;
+                    break;
+                case 5:
+                    inputs.Rests = new float[0];
+                    inputs.Valid = false;
+                    break;
+            }
+
+            return inputs;
         }
 
         private sealed class Layout
@@ -1509,6 +2101,16 @@ namespace VRMate.Tests
             ScreenRect? startMonitor = null;
             var frame = 0;
 
+            // 待機の切れ目: seed 1 はいつも切れ目にある（自作の待機がない）。ほかは、切れ目にある・ない の区間が入れ替わる
+            var alwaysAtBoundary = seed == 1;
+            var boundaryUntil = 0.0;
+            var clip = NoisyClipInputs(events);
+            var nextClip = Exponential(events, 20.0);
+
+            // 切れ目を待っているはずかを見るための待ちの始まり。切れ目にあるのに歩き出さなかったフレームでも始め直す（歩き出せずに待ちへ戻ったかもしれない）
+            double? holdCheckSince = 0.0;
+            var walkScale = double.NaN;
+
             while (rig.Clock < Seconds)
             {
                 frame++;
@@ -1518,6 +2120,25 @@ namespace VRMate.Tests
                 rig.Talking = false;
                 rig.BodyOverride = null;
                 rig.MonitorList = setup.Monitors;
+                if (alwaysAtBoundary)
+                {
+                    rig.IdleAtBoundary = true;
+                }
+                else if (rig.Clock >= boundaryUntil)
+                {
+                    rig.IdleAtBoundary = events.Next(10) < 3;
+                    boundaryUntil = rig.Clock + (rig.IdleAtBoundary ? Exponential(events, 0.3) : Exponential(events, 4.0));
+                }
+
+                if (rig.Clock >= nextClip && rig.Walk.Weight == 0f)
+                {
+                    clip = NoisyClipInputs(events);
+                    nextClip = rig.Clock + Exponential(events, 20.0);
+                }
+
+                rig.ClipLength = clip.Length;
+                rig.StartTime = clip.Start;
+                rig.RestTimes = clip.Rests;
                 if (breakKind < 0 && rig.Clock >= nextBreak)
                 {
                     breakKind = events.Next(8);
@@ -1619,7 +2240,51 @@ namespace VRMate.Tests
                     Require(rig.Clock - readySince.Value >= (double)WalkSequence.MinWaitSeconds - 3.0 * MaxDelta, "待ちが 15 秒に満たない（待ちの始まり " + readySince.Value + "）");
                     startMonitor = StartMonitor(log.Body, log.Monitors);
                     Require(startMonitor.HasValue, "歩き始めのモニターがない");
+                    Require(log.IdleAtBoundary, "待機が切れ目にないのに歩き出した");
                     totals.Walks++;
+
+                    // 歩き出したフレームの時刻 = 歩き出しの時刻（不正な組なら 0）+ 倍率 × delta
+                    var from = clip.Valid ? clip.Start : 0f;
+                    var advanced = (double)log.Time - from;
+                    Require(advanced >= -WeightTolerance && advanced <= (double)WalkSequence.MaxSpeedScale * log.Delta + WeightTolerance, "歩き出したフレームの時刻が " + from + " から始まっていない（" + log.Time + "）");
+                    totals.WalksFromStartTime += clip.Valid ? 1 : 0;
+                    totals.WalksFromZero += clip.Valid ? 0 : 1;
+                    walkScale = log.Delta > 0f ? advanced / log.Delta : double.NaN;
+                }
+
+                // 時刻は 1 秒に倍率の秒ずつ進み、倍率は 0.5〜0.75 で、その歩きの間は変わらない
+                if (!log.Started && log.Delta > 0f && (log.PrevWeight > 0f || log.Weight > 0f))
+                {
+                    var rate = ((double)log.Time - log.PrevTime) / log.Delta;
+                    Require(rate >= (double)WalkSequence.MinSpeedScale - 2e-3 && rate <= (double)WalkSequence.MaxSpeedScale + 2e-3, "時刻の進みが倍率 0.5〜0.75 にない（" + rate + "）");
+                    if (double.IsNaN(walkScale))
+                    {
+                        walkScale = rate;
+                    }
+
+                    Require(Math.Abs(rate - walkScale) <= 2e-3, "歩きの途中で時刻の進みが変わった（" + walkScale + " → " + rate + "）");
+                }
+
+                // 重みが正の間は待機の押さえを求め、歩き出せる状態が崩れて重みが 0 なら求めない
+                if (log.Weight > 0f)
+                {
+                    Require(log.HoldIdle, "重みが正なのに待機の押さえを求めない");
+                }
+                else if (!walkable)
+                {
+                    Require(!log.HoldIdle, "歩き出せる状態が崩れて重みが 0 なのに待機の押さえを求めた");
+                }
+                else if (log.HoldIdle && !log.IsWalking)
+                {
+                    totals.BoundaryWaitFrames++;
+                    Require(holdOver && readySince.HasValue && rig.Clock - readySince.Value >= (double)WalkSequence.MinWaitSeconds - 3.0 * MaxDelta, "待ちが終わる前に待機の押さえを求めた");
+                }
+
+                // 待ちが 30 秒を越えても切れ目がなければ、切れ目を待っている
+                if (walkable && holdOver && log.Weight == 0f && !log.IsWalking && !log.IdleAtBoundary && holdCheckSince.HasValue
+                    && rig.Clock - holdCheckSince.Value >= (double)WalkSequence.MaxWaitSeconds + 3.0 * MaxDelta)
+                {
+                    Require(log.HoldIdle, "待ちが終わって切れ目を待っているのに待機の押さえを求めない");
                 }
 
                 // 崩れたフレームからは動かず、重みは 0.3 秒の割合で下がる
@@ -1642,7 +2307,8 @@ namespace VRMate.Tests
                     Require(log.IsWalking, "歩いていないのに動いた");
                     Require(log.Weight > 0f, "重み 0 で動いた");
                     Require(Math.Sign(log.StepX) == log.Direction, "向きと逆に動いた");
-                    Require(Math.Abs((double)log.StepX) <= FullSpeed(log.Px) * log.Weight * log.Delta + StepTolerance, "速すぎる");
+                    var scale = double.IsNaN(walkScale) ? (double)WalkSequence.MaxSpeedScale : walkScale;
+                    Require(Math.Abs((double)log.StepX) <= FullSpeed(log.Px, scale) * log.Weight * log.Delta + StepTolerance, "速すぎる（倍率 " + scale + "）");
                     Require(startMonitor.HasValue, "歩き出していないのに動いた");
                     var monitor = startMonitor.Value;
                     if (log.StepX > 0f)
@@ -1670,10 +2336,24 @@ namespace VRMate.Tests
                 if (!walkable || !holdOver || log.IsWalking || log.Weight > 0f)
                 {
                     readySince = null;
+                    holdCheckSince = null;
                 }
-                else if (!readySince.HasValue)
+                else
                 {
-                    readySince = rig.Clock;
+                    if (!readySince.HasValue)
+                    {
+                        readySince = rig.Clock;
+                    }
+
+                    if (!holdCheckSince.HasValue || log.IdleAtBoundary)
+                    {
+                        holdCheckSince = rig.Clock;
+                    }
+                }
+
+                if (!log.IsWalking && log.Weight == 0f)
+                {
+                    walkScale = double.NaN;
                 }
             }
         }
@@ -1682,7 +2362,8 @@ namespace VRMate.Tests
         {
             return "[体 X " + log.Body.X + " 幅 " + log.Body.Width + "、px " + log.Px + "、delta " + log.Delta
                 + "、StepX " + log.StepX + "、重み " + log.PrevWeight + " → " + log.Weight + "、向き " + log.Direction
-                + "、歩いている " + log.PrevWalking + " → " + log.IsWalking + "]";
+                + "、歩いている " + log.PrevWalking + " → " + log.IsWalking + "、時刻 " + log.PrevTime + " → " + log.Time
+                + "、切れ目 " + log.IdleAtBoundary + "、押さえ " + log.PrevHoldIdle + " → " + log.HoldIdle + "]";
         }
 
         private static double Exponential(Random random, double mean)
