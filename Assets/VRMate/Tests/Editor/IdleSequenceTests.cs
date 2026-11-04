@@ -167,6 +167,9 @@ namespace VRMate.Tests
             public bool Talking;
             public bool Idle = true;
 
+            /// <summary>null でなければ、毎フレーム SetHold に渡す（null の間は呼ばない）。</summary>
+            public bool? Hold;
+
             /// <summary>Step のたびに、その層と頭打ち後の delta で呼ぶ（null なら呼ばない）。</summary>
             public Action<Snapshot, float> AfterStep;
 
@@ -209,6 +212,11 @@ namespace VRMate.Tests
             public Snapshot Step(float delta)
             {
                 Sequence.SetTalking(Talking);
+                if (Hold.HasValue)
+                {
+                    Sequence.SetHold(Hold.Value);
+                }
+
                 Sequence.Advance(delta, Idle);
                 Elapsed += Clamped(delta);
                 var now = Snapshot.Of(Sequence);
@@ -3467,6 +3475,489 @@ namespace VRMate.Tests
             Assert.That(reloads, Is.GreaterThan(5), "読み直しが少ない");
             Assert.That(discards, Is.GreaterThan(10), "捨てたクリップが少ない");
             Assert.That(keptOnlyByInUse, Is.GreaterThan(100), "最後に渡した一覧になく IsInUse だけで残した場面が少ない");
+        }
+
+        // ---- 押さえ（歩きが待機の切れ目を求める） ----
+
+        [Test]
+        [Description("押さえている間、通常のクリップは混ぜの開始点で止まってその姿勢を保ち、次のクリップへ進まない")]
+        public void Advance_StopsTheNormalClipAtItsCrossFadeStart_WhileHeld()
+        {
+            var driver = Started();
+            driver.Hold = true;
+
+            var at = driver.RunTo(3.1);
+            var later = driver.CollectTo(20.0);
+
+            AssertTokens(at, new[] { A }, "混ぜの開始点（3 秒）");
+            Assert.That(at.Single(A).Time, Is.InRange(3f - Tolerance, 3f + Frame + Tolerance), "A は混ぜの開始点で止まる " + at);
+            Assert.That(at.Own, Is.EqualTo(1f).Within(Tolerance), "自作の待機が全体に出ている " + at);
+            foreach (var snapshot in later)
+            {
+                AssertTokens(snapshot, new[] { A }, "押さえている間");
+                Assert.That(snapshot.Single(A).Time, Is.EqualTo(at.Single(A).Time), "姿勢が動いた " + snapshot);
+            }
+        }
+
+        [Test]
+        [Description("押さえていて、通常のクリップが混ぜの開始点にあり、混ぜの途中でなければ、切れ目で止まっていると返す")]
+        public void HeldAtBoundary_IsTrue_OnlyOnceTheHeldClipReachesItsCrossFadeStart()
+        {
+            var driver = Started();
+            driver.Hold = true;
+
+            driver.RunTo(2.9);
+            var before = driver.Sequence.HeldAtBoundary;
+            driver.RunTo(3.1);
+            var at = driver.Sequence.HeldAtBoundary;
+
+            Assert.That(before, Is.False, "混ぜの開始点の前");
+            Assert.That(at, Is.True, "混ぜの開始点");
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        [Description("押さえを求めないとき（一度も SetHold を呼ばない・false を渡し続ける）は、切れ目で止まっていると返さない")]
+        public void HeldAtBoundary_IsFalse_WhenNotHeld(bool callSetHoldWithFalse)
+        {
+            var driver = new Driver(Normal3(), Talk2());
+            if (callSetHoldWithFalse)
+            {
+                driver.Hold = false;
+            }
+
+            var heldFrames = 0;
+            driver.AfterStep = (snapshot, delta) => heldFrames += driver.Sequence.HeldAtBoundary ? 1 : 0;
+            var snapshots = driver.CollectTo(26.0);
+
+            Assert.That(heldFrames, Is.EqualTo(0));
+            Assert.That(IncomingOrder(snapshots), Is.EqualTo(new[] { A, B, C, A, B, C, A }), "押さえないときの順が変わった");
+        }
+
+        [Test]
+        [Description("押さえを解くと、止まっていた点から次のクリップへ混ぜ始め、そのあとは通常の順で進む")]
+        public void Advance_CrossFadesToTheNextClipFromWhereItStopped_WhenTheHoldIsReleased()
+        {
+            var driver = Started();
+            driver.Hold = true;
+            var held = driver.RunTo(8.0).Single(A).Time;
+
+            driver.Hold = false;
+            var released = driver.Step(Frame);
+
+            AssertTokens(released, new[] { A, B }, "解いた次の Advance で混ぜ始める");
+            Assert.That(released.Layers[0].Time, Is.InRange(held, held + Frame + Tolerance), "A は止まっていた時刻から進む " + released);
+            Assert.That(released.Layers[1].Time, Is.InRange(0f, Frame + Tolerance), "B は 0 から " + released);
+            Assert.That(driver.Sequence.HeldAtBoundary, Is.False, "混ぜの途中");
+
+            var snapshots = driver.CollectTo(8.0 + 20.0);
+            Assert.That(IncomingOrder(snapshots), Is.EqualTo(new[] { B, C, A, B, C }), string.Join(",", IncomingOrder(snapshots)));
+        }
+
+        [Test]
+        [Description("混ぜの途中で押さえ始めると、その混ぜは最後まで進み、入ってきたクリップが混ぜの開始点で止まり、混ぜの途中は切れ目で止まっていると返さない")]
+        public void Advance_FinishesTheCrossFadeAndStopsTheIncomingClip_WhenHeldDuringACrossFade()
+        {
+            var driver = Started();
+            driver.RunTo(3.5);
+            AssertTokens(driver.Now, new[] { A, B }, "前提: A から B へ混ぜている");
+            driver.Hold = true;
+
+            var heldDuringMix = 0;
+            driver.AfterStep = (snapshot, delta) => heldDuringMix += snapshot.Count == 2 && driver.Sequence.HeldAtBoundary ? 1 : 0;
+            var mixed = driver.RunTo(4.1);
+            driver.AfterStep = null;
+
+            AssertTokens(mixed, new[] { B }, "混ぜが最後まで進む");
+            Assert.That(heldDuringMix, Is.EqualTo(0), "混ぜの途中で切れ目で止まっていると返した");
+
+            // B は 3 秒ごろに始まり、混ぜの開始点 4 秒（7 秒ごろ）で止まる
+            var stopped = driver.RunTo(7.2);
+            AssertTokens(stopped, new[] { B }, "B の混ぜの開始点");
+            Assert.That(stopped.Single(B).Time, Is.InRange(4f - Tolerance, 4f + Frame + Tolerance), stopped.ToString());
+            Assert.That(driver.Sequence.HeldAtBoundary, Is.True);
+            Assert.That(driver.CollectTo(15.0).All(s => s.Tokens.SequenceEqual(new[] { B })), Is.True, "C へ進んだ");
+        }
+
+        [Test]
+        [Description("通常のクリップが 1 本だけでも、押さえている間は自分自身へ混ぜず、解くと自分自身へ混ぜ始める")]
+        public void Advance_DoesNotRepeatTheOnlyClip_WhileHeld()
+        {
+            var driver = new Driver(Clips(new IdleClip(A, 4f)), None()) { Hold = true };
+
+            var snapshots = driver.CollectTo(10.0);
+            Assert.That(snapshots.All(s => s.Count <= 1), Is.True, "自分自身へ混ぜた");
+            Assert.That(snapshots.Last().Single(A).Time, Is.InRange(3f - Tolerance, 3f + Frame + Tolerance));
+            Assert.That(driver.Sequence.HeldAtBoundary, Is.True);
+
+            driver.Hold = false;
+            var released = driver.Step(Frame);
+            AssertTokens(released, new[] { A, A }, "解いたら自分自身へ混ぜる");
+        }
+
+        [Test]
+        [Description("混ぜの開始点がクリップの始まり（長さが混ぜの秒以下）なら、押さえている間は始まりの姿勢で止まる")]
+        public void Advance_StopsAtTheStart_WhenTheClipIsNotLongerThanTheCrossFadeAndHeld()
+        {
+            var driver = new Driver(Clips(new IdleClip(A, 0.5f), new IdleClip(B, 4f)), None()) { Hold = true };
+
+            var first = driver.RunTo(0.5);
+            var snapshots = driver.CollectTo(5.0);
+
+            AssertTokens(first, new[] { A }, "B へ進んだ");
+            Assert.That(first.Single(A).Time, Is.InRange(0f, Frame + Tolerance), first.ToString());
+            Assert.That(snapshots.All(s => s.Tokens.SequenceEqual(new[] { A }) && s.Single(A).Time == first.Single(A).Time), Is.True, "止まらない");
+            Assert.That(driver.Sequence.HeldAtBoundary, Is.True);
+        }
+
+        [Test]
+        [Description("押さえている間に話し始めると、今と同じく話す間のクリップへ移り、その間は切れ目で止まっていると返さない")]
+        public void Advance_MovesToTheTalkClip_WhenTalkingStartsWhileHeld()
+        {
+            var driver = Started();
+            driver.Hold = true;
+            driver.RunTo(5.0);
+            Assert.That(driver.Sequence.HeldAtBoundary, Is.True, "前提: 切れ目で止まっている");
+
+            driver.Talking = true;
+            var talking = driver.RunTo(5.0 + IdleSequence.TalkFadeSeconds + 0.1);
+
+            AssertTokens(talking, new[] { T }, "話す間のクリップへ移る");
+            Assert.That(driver.Sequence.HeldAtBoundary, Is.False);
+        }
+
+        [Test]
+        [Description("押さえている間に待機から外れると今と同じく自作の待機が消え、待機へ戻ると止まっていた姿勢のまま切れ目で止まっている")]
+        public void Advance_LeavesAndReturnsToTheHeldPose_WhenIdleChangesWhileHeld()
+        {
+            var driver = Started();
+            driver.Hold = true;
+            var held = driver.RunTo(5.0).Single(A).Time;
+
+            driver.Idle = false;
+            var away = driver.RunTo(5.0 + IdleSequence.LeaveIdleSeconds + 0.05);
+            Assert.That(away.Count, Is.EqualTo(0), "待機から外れても自作の待機が消えない");
+
+            driver.Idle = true;
+            var back = driver.RunTo(7.0);
+            AssertTokens(back, new[] { A }, "待機へ戻ったら止まっていた A");
+            Assert.That(back.Single(A).Time, Is.EqualTo(held), "止まっていた姿勢から動いた");
+            Assert.That(back.Own, Is.EqualTo(1f).Within(Tolerance));
+            Assert.That(driver.Sequence.HeldAtBoundary, Is.True);
+        }
+
+        [Test]
+        [Description("押さえている間に新しい一覧が来ても、今と同じく順が最初に戻るまで待ち、押さえを解いたあとは今の一覧の次のクリップへ進む")]
+        public void SetClips_WaitsForTheWrap_WhileHeld()
+        {
+            var driver = Started();
+            driver.Hold = true;
+            driver.RunTo(5.0);
+
+            driver.SetClips(Clips(new IdleClip(X, 3f), new IdleClip(Y, 3f)), None());
+            var held = driver.CollectTo(10.0);
+            driver.Hold = false;
+            var released = driver.CollectTo(10.0 + 3.0);
+
+            Assert.That(held.All(s => s.Tokens.SequenceEqual(new[] { A })), Is.True, "押さえている間に新しい一覧へ移った");
+            Assert.That(IncomingOrder(released).First(), Is.EqualTo(B), "解いたあと今の一覧の次へ進まない");
+            Assert.That(driver.Sequence.IsInUse(X), Is.True, "待っている一覧を捨てた");
+        }
+
+        [Test]
+        [Description("自作の待機の一覧が空の間に一覧が来ると、押さえていても今と同じくすぐ最初のクリップから使い、その混ぜの開始点で止まる")]
+        public void SetClips_StartsTheFirstClipAtOnce_WhileHeldWithNoClipsInUse()
+        {
+            var driver = new Driver(None(), None()) { Hold = true };
+            driver.RunTo(1.0);
+
+            driver.SetClips(Clips(new IdleClip(X, 3f), new IdleClip(Y, 3f)), None());
+            var snapshots = driver.CollectTo(1.0 + 6.0);
+
+            Assert.That(snapshots.All(s => !s.Has(Y)), Is.True, "押さえているのに次のクリップへ進んだ");
+            AssertTokens(snapshots.Last(), new[] { X }, "最初のクリップが出ていない");
+            Assert.That(snapshots.Last().Single(X).Time, Is.InRange(2f - Tolerance, 2f + Frame + Tolerance));
+            Assert.That(driver.Sequence.HeldAtBoundary, Is.True);
+        }
+
+        [Test]
+        [Description("押さえている間、通常のクリップの時刻は混ぜの開始点（長さ − 1 秒）ちょうどで止まり、フレームの区切りがそこに合わなくても越えない")]
+        public void Advance_NeverMovesTheHeldClipPastItsCrossFadeStart()
+        {
+            // 0.035 秒ずつ進めると、A の時刻は 2.975 から 3.01 へ進むところで混ぜの開始点 3 をまたぐ
+            const float Uneven = 0.035f;
+            var driver = new Driver(Normal3(), None()) { Hold = true };
+
+            var snapshots = driver.CollectTo(6.0, Uneven);
+
+            Assert.That(snapshots.All(s => s.Tokens.SequenceEqual(new[] { A })), Is.True, "A のほかの層がある");
+            Assert.That(snapshots.Max(s => s.Single(A).Time), Is.LessThanOrEqualTo(3f), "混ぜの開始点を越えた");
+            Assert.That(snapshots.Last().Single(A).Time, Is.EqualTo(3f), "混ぜの開始点で止まっていない");
+            Assert.That(driver.Sequence.HeldAtBoundary, Is.True);
+        }
+
+        [Test]
+        [Description("押さえている間に始まっていた混ぜの途中では、出ていくクリップの時刻も止まらずに進む")]
+        public void Advance_KeepsTheOutgoingClipMoving_WhenHeldDuringACrossFade()
+        {
+            var driver = Started();
+            driver.RunTo(3.3);
+            AssertTokens(driver.Now, new[] { A, B }, "前提: A から B へ混ぜている");
+            driver.Hold = true;
+
+            var previous = driver.Now;
+            var checkedFrames = 0;
+            while (driver.Now.Count == 2)
+            {
+                var now = driver.Step(Frame);
+                if (now.Count == 2)
+                {
+                    Assert.That(now.Layers[0].Time, Is.EqualTo(Math.Min(previous.Layers[0].Time + Frame, 4f)).Within(1e-5f), "出ていく A の時刻が進まない " + now);
+                    checkedFrames++;
+                }
+
+                previous = now;
+            }
+
+            Assert.That(checkedFrames, Is.GreaterThan(30), "混ぜの途中のフレームが少ない");
+        }
+
+        [Test]
+        [Description("押さえている間でも、話す間のクリップは混ぜの開始点で止まらず、越えたフレームではその分だけ進んでから自分自身へ混ぜ始める")]
+        public void Advance_KeepsTheTalkClipMovingPastItsCrossFadeStart_WhileHeld()
+        {
+            // 0.03 秒ずつ進めると、T の時刻は 4.98 から 5.01 へ進むところで混ぜの開始点 5 をまたぐ
+            const float Uneven = 0.03f;
+            var driver = Started();
+            driver.Hold = true;
+            driver.RunTo(5.0);
+            Assert.That(driver.Sequence.HeldAtBoundary, Is.True, "前提: 切れ目で止まっている");
+            driver.Talking = true;
+
+            var previous = driver.Now;
+            var checkedFrames = 0;
+            var crossings = 0;
+            var end = driver.Elapsed + 12.0;
+            while (driver.Elapsed < end)
+            {
+                var now = driver.Step(Uneven);
+                var before = previous.Layers.Where(l => l.Token == T).ToList();
+                var after = now.Layers.Where(l => l.Token == T).ToList();
+                if (before.Count == 1 && after.Count >= 1)
+                {
+                    // 混ぜの間は層 0 が出ていく側なので、前のフレームの T の続きは今のフレームの最初の T の層
+                    Assert.That(after[0].Time, Is.EqualTo(Math.Min(before[0].Time + Uneven, 6f)).Within(1e-4f), "T の時刻が delta だけ進まない " + now);
+                    checkedFrames++;
+                    if (before[0].Time < 5f && after[0].Time > 5f + Tolerance)
+                    {
+                        crossings++;
+                    }
+                }
+
+                previous = now;
+            }
+
+            Assert.That(checkedFrames, Is.GreaterThan(300), "T が出ているフレームが少ない");
+            Assert.That(crossings, Is.GreaterThanOrEqualTo(2), "T が混ぜの開始点を越えたフレームが少ない");
+        }
+
+        /// <summary>
+        /// 一覧 Normal3 の途中で空の一覧を渡し、C から最初に戻る 12 秒ごろに空の一覧へ移ったところで押さえ始める。
+        /// 最後の C は自作の待機が 1 秒かけて消える間、時刻 5 から 6 へ流れる。
+        /// </summary>
+        private static Driver EmptiedAndHeld()
+        {
+            var driver = Started();
+            driver.SetClips(None(), None());
+            driver.RunTo(12.1);
+            var now = driver.Now;
+            AssertTokens(now, new[] { C }, "前提: 最後の C が消えていく途中");
+            Assert.That(now.Own, Is.LessThan(1f), "前提: 自作の待機が消え始めていない " + now);
+            driver.Hold = true;
+            return driver;
+        }
+
+        [Test]
+        [Description("通常のクリップの一覧が空になった直後に消えていく最後のクリップは、押さえていても止まらずに進む")]
+        public void Advance_KeepsTheLastClipMovingWhileItFadesOut_EvenWhenHeld()
+        {
+            var driver = EmptiedAndHeld();
+            var previous = driver.Now;
+
+            var snapshots = driver.CollectTo(12.6);
+
+            Assert.That(snapshots.All(s => s.Tokens.SequenceEqual(new[] { C })), Is.True, "C が消えていく途中でなくなった");
+            foreach (var now in snapshots)
+            {
+                Assert.That(now.Single(C).Time, Is.EqualTo(Math.Min(previous.Single(C).Time + Frame, 6f)).Within(1e-5f), "C が止まった " + now);
+                previous = now;
+            }
+        }
+
+        [Test]
+        [Description("通常のクリップが 0 本のときは、押さえていて最後のクリップが混ぜの開始点を過ぎて消えていく途中でも、切れ目で止まっているとは返さない")]
+        public void HeldAtBoundary_IsFalse_WhenThereAreNoNormalClips()
+        {
+            var empty = new IdleSequence();
+            empty.SetHold(true);
+            empty.Advance(Frame, true);
+            Assert.That(empty.HeldAtBoundary, Is.False, "一度も一覧を渡していない");
+
+            var driver = EmptiedAndHeld();
+            var heldFrames = new List<bool>();
+            driver.AfterStep = (snapshot, delta) => heldFrames.Add(driver.Sequence.HeldAtBoundary);
+            var fading = driver.CollectTo(12.6);
+
+            Assert.That(fading.All(s => s.Count == 1), Is.True, "前提: 最後のクリップが消えていく途中でない");
+            Assert.That(heldFrames.Any(held => held), Is.False, "通常のクリップがないのに切れ目で止まっていると返した");
+        }
+
+        [Test]
+        [Description("通常のクリップの一覧が空なら、まだ一覧を渡していないときも、空の一覧・null・長さが不正なクリップだけの一覧を渡したときも、通常のクリップがないと返す")]
+        public void HasNormalClips_IsFalse_WhenTheNormalListIsEmpty()
+        {
+            var sequence = new IdleSequence();
+            Assert.That(sequence.HasNormalClips, Is.False, "一覧を渡していない");
+
+            sequence.SetClips(None(), Talk2());
+            Assert.That(sequence.HasNormalClips, Is.False, "空の一覧");
+
+            sequence.SetClips(null, null);
+            Assert.That(sequence.HasNormalClips, Is.False, "null");
+
+            sequence.SetClips(Clips(new IdleClip(A, 0f), new IdleClip(B, float.NaN), new IdleClip(C, float.PositiveInfinity)), None());
+            sequence.Advance(Frame, true);
+            Assert.That(sequence.HasNormalClips, Is.False, "長さが不正なクリップだけ");
+        }
+
+        [Test]
+        [Description("通常のクリップの一覧を渡すと、次の Advance を待たずにその直後から、通常のクリップがあると返す")]
+        public void HasNormalClips_IsTrue_RightAfterAListIsGiven()
+        {
+            var sequence = new IdleSequence();
+
+            sequence.SetClips(Normal3(), None());
+
+            Assert.That(sequence.HasNormalClips, Is.True);
+        }
+
+        [Test]
+        [Description("次の一覧が空で順が最初に戻ると、そのフレームから通常のクリップがないと返し、最後のクリップが消えていく途中も返し続ける")]
+        public void HasNormalClips_IsFalse_FromTheWrapToAnEmptyList_WhileTheLastClipFadesOut()
+        {
+            var driver = Started();
+            driver.SetClips(None(), None());
+            var flags = new List<bool>();
+            var times = new List<double>();
+            driver.AfterStep = (snapshot, delta) =>
+            {
+                flags.Add(driver.Sequence.HasNormalClips);
+                times.Add(driver.Elapsed);
+            };
+
+            var snapshots = driver.CollectTo(15.0);
+
+            var wrap = flags.IndexOf(false);
+            Assert.That(wrap, Is.GreaterThan(0), "最初に戻っても通常のクリップがあると返し続けた");
+            Assert.That(flags.Take(wrap).All(f => f), Is.True, "最初に戻る前に通常のクリップがないと返した");
+            Assert.That(flags.Skip(wrap).All(f => !f), Is.True, "最初に戻ったあとで通常のクリップがあると返した");
+            Assert.That(times[wrap], Is.InRange(12.0 - Slack, 12.0 + Slack), "最初に戻る 12 秒ごろでない");
+            Assert.That(snapshots[wrap].Tokens, Is.EqualTo(new[] { C }), "最初に戻ったフレームで最後のクリップが消えていく途中でない " + snapshots[wrap]);
+            Assert.That(snapshots[wrap].Own, Is.GreaterThan(0.5f), "前提: 最後のクリップがまだ出ている " + snapshots[wrap]);
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        [Description("通常のクリップがあるかどうかは、押さえの有無で変わらない")]
+        public void HasNormalClips_DoesNotDependOnTheHold(bool hold)
+        {
+            var driver = new Driver(None(), None()) { Hold = hold };
+            var empty = new List<bool>();
+            driver.AfterStep = (snapshot, delta) => empty.Add(driver.Sequence.HasNormalClips);
+            driver.CollectTo(2.0);
+            driver.SetClips(Normal3(), None());
+            var flags = new List<bool>();
+            driver.AfterStep = (snapshot, delta) => flags.Add(driver.Sequence.HasNormalClips);
+            driver.CollectTo(2.0 + 10.0);
+
+            Assert.That(empty.All(f => !f), Is.True, "押さえ " + hold + ": 一覧が空なのに通常のクリップがあると返した");
+            Assert.That(flags.All(f => f), Is.True, "押さえ " + hold + ": 一覧があるのに通常のクリップがないと返した");
+        }
+
+        [TestCase(1)]
+        [TestCase(2)]
+        [TestCase(3)]
+        [Description("押さえ・待機の出入り・一覧の差し替え・フレームの長さを乱数で変えても、通常の順が次のクリップへ混ぜ始めるのは押さえを求めていないフレームだけで、押さえている間は混ぜの開始点に着いたクリップの姿勢が動かない")]
+        public void Advance_MovesToTheNextClipOnlyWhenNotHeld_ForRandomOperations(int seed)
+        {
+            var random = new Random(seed * 6151);
+            var driver = new Driver(Normal3(), None()) { Hold = false };
+            var lists = new[]
+            {
+                Normal3(),
+                Clips(new IdleClip(X, 2f), new IdleClip(Y, 0.5f)),
+                Clips(new IdleClip(Z, 4f)),
+                None(),
+            };
+            var deltas = new[] { Frame, Frame, Frame, 1f / 30f, 1f / 144f, 0.2f, 0f };
+
+            var heldStill = 0;
+            var mixesStarted = 0;
+            var heldFrames = 0;
+
+            // 最後に渡した一覧が空なら、残ったクリップが本家へ戻りながら流れる（押さえの対象かを計画が決めていない）ので、姿勢の止まり方は確かめない
+            var lastGivenEmpty = false;
+            for (var frame = 0; frame < 60 * 600; frame++)
+            {
+                var roll = random.Next(1000);
+                var setClips = false;
+                if (roll < 30)
+                {
+                    driver.Hold = !driver.Hold.Value;
+                }
+                else if (roll < 38)
+                {
+                    driver.Idle = !driver.Idle;
+                }
+                else if (roll < 41)
+                {
+                    var list = lists[random.Next(lists.Length)];
+                    driver.SetClips(list, None());
+                    setClips = true;
+                    lastGivenEmpty = list.Length == 0;
+                }
+
+                var hold = driver.Hold.Value;
+                var before = driver.Now;
+                var now = driver.Step(deltas[random.Next(deltas.Length)]);
+                var because = "seed " + seed + " frame " + frame + " 押さえ " + hold + " 前 " + before + " 今 " + now;
+
+                var newMix = before.Count >= 1 && now.Count == 2
+                    && (before.Count == 1 || now.Layers[1].Time < before.Layers[1].Time || now.Layers[1].Token != before.Layers[1].Token);
+                if (newMix && !setClips)
+                {
+                    mixesStarted++;
+                    Assert.That(hold, Is.False, because + "（押さえているのに次のクリップへ混ぜ始めた）");
+                }
+
+                if (hold)
+                {
+                    heldFrames++;
+                    if (before.Count == 1 && now.Count == 1 && before.Layers[0].Token == now.Layers[0].Token && !setClips && !lastGivenEmpty)
+                    {
+                        var length = driver.Lengths[now.Layers[0].Token];
+                        if (before.Layers[0].Time >= Math.Max(0f, length - IdleSequence.CrossFadeSeconds))
+                        {
+                            heldStill++;
+                            Assert.That(now.Layers[0].Time, Is.EqualTo(before.Layers[0].Time), because + "（押さえているのに混ぜの開始点から進んだ）");
+                        }
+                    }
+                }
+            }
+
+            Assert.That(mixesStarted, Is.GreaterThan(20), "混ぜ始めたフレームが少ない");
+            Assert.That(heldStill, Is.GreaterThan(1000), "切れ目で押さえているフレームが少ない");
+            Assert.That(heldFrames, Is.GreaterThan(1000), "押さえているフレームが少ない");
         }
 
         // ---- 判定の不変条件 ----

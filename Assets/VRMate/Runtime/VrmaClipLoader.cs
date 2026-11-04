@@ -62,8 +62,30 @@ namespace VRMate
         /// </summary>
         public static void ApplyPose(HumanPoseHandler avatarPose, VrmaClip motion, float time, float weight, ref HumanPose targetPose, ref HumanPose sourcePose)
         {
+            Sample(motion, time, ref sourcePose);
+            Blend(avatarPose, weight, ref targetPose, ref sourcePose);
+        }
+
+        /// <summary>
+        /// As ApplyPose, with the clip's body turned by turn first: turn multiplies the clip's bodyRotation
+        /// and bodyPosition from the left, so it turns the whole body about the avatar root's origin.
+        /// </summary>
+        public static void ApplyPose(HumanPoseHandler avatarPose, VrmaClip motion, float time, float weight, Quaternion turn, ref HumanPose targetPose, ref HumanPose sourcePose)
+        {
+            Sample(motion, time, ref sourcePose);
+            sourcePose.bodyRotation = turn * sourcePose.bodyRotation;
+            sourcePose.bodyPosition = turn * sourcePose.bodyPosition;
+            Blend(avatarPose, weight, ref targetPose, ref sourcePose);
+        }
+
+        private static void Sample(VrmaClip motion, float time, ref HumanPose sourcePose)
+        {
             motion.Clip.SampleAnimation(motion.Root, Mathf.Min(time, motion.Clip.length));
             motion.Pose.GetHumanPose(ref sourcePose);
+        }
+
+        private static void Blend(HumanPoseHandler avatarPose, float weight, ref HumanPose targetPose, ref HumanPose sourcePose)
+        {
             avatarPose.GetHumanPose(ref targetPose);
 
             var muscles = targetPose.muscles;

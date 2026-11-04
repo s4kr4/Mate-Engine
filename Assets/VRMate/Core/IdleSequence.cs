@@ -57,7 +57,9 @@ namespace VRMate
     /// layer o, and during a cross-fade the outgoing layer o(1 - c) and the incoming layer o * c, where
     /// o = (being idle) * (own idle shown) and c is the cross-fade progress. Every share moves at a
     /// bounded rate, so the pose never jumps. A new clip list waits for the order to wrap, so a clip is
-    /// never cut short. Not thread-safe; call from one thread.
+    /// never cut short. While held (SetHold true) the normal order does not move on: the normal clip
+    /// stops at the point where it would start fading into the next and keeps that pose; talking,
+    /// leaving idle and new lists work as without the hold. Not thread-safe; call from one thread.
     /// </summary>
     public sealed class IdleSequence
     {
@@ -103,6 +105,9 @@ namespace VRMate
         private bool _talkingNow;
         private float _hold;
 
+        // The walk waits for the boundary or is showing: the normal order must not move on.
+        private bool _orderHeld;
+
         // The shown clip (the outgoing one during a cross-fade) and the incoming one.
         private Playing _current;
         private Playing _incoming;
@@ -138,6 +143,21 @@ namespace VRMate
 
                 return _incoming == null ? 1 : 2;
             }
+        }
+
+        /// <summary>
+        /// Held, with a normal clip stopped where it would start fading into the next and no cross-fade
+        /// running: the pose is at a boundary between clips and stays there.
+        /// </summary>
+        public bool HeldAtBoundary
+        {
+            get { return _orderHeld && _normal.Length > 0 && _current != null && !_current.IsTalk && !Mixing && _current.AtCrossFadeStart; }
+        }
+
+        /// <summary>False while upstream's idle shows (or is coming back) because no normal clip is in use.</summary>
+        public bool HasNormalClips
+        {
+            get { return _normal.Length > 0; }
         }
 
         private float Overall
@@ -201,6 +221,12 @@ namespace VRMate
             }
 
             _talkingNow = talking;
+        }
+
+        /// <summary>Takes effect at the next Advance. Releasing lets the stopped clip fade into the next one from where it stopped.</summary>
+        public void SetHold(bool hold)
+        {
+            _orderHeld = hold;
         }
 
         /// <summary>Cancel and disconnect: talking ends without the hold. A later SetTalking(true) talks again.</summary>
@@ -355,7 +381,15 @@ namespace VRMate
         {
             if (_current != null)
             {
-                _current.Advance(delta);
+                // Without normal clips there is no next clip to hold back: the last one plays on as it fades out.
+                if (_orderHeld && !Mixing && !_current.IsTalk && _normal.Length > 0)
+                {
+                    _current.AdvanceToCrossFadeStart(delta);
+                }
+                else
+                {
+                    _current.Advance(delta);
+                }
             }
 
             if (_incoming != null)
@@ -421,7 +455,7 @@ namespace VRMate
                 return;
             }
 
-            if (!_current.AtCrossFadeStart)
+            if (!_current.AtCrossFadeStart || _orderHeld)
             {
                 return;
             }
@@ -612,6 +646,19 @@ namespace VRMate
             public void Advance(float delta)
             {
                 Time = Math.Min(Time + delta, Length);
+            }
+
+            /// <summary>
+            /// Stops at the cross-fade start, or where it is when already past it (it became the shown
+            /// clip during a cross-fade): the held pose never moves back.
+            /// </summary>
+            public void AdvanceToCrossFadeStart(float delta)
+            {
+                var start = Math.Max(0f, Length - CrossFadeSeconds);
+                if (Time < start)
+                {
+                    Time = Math.Min(Time + delta, start);
+                }
             }
         }
     }

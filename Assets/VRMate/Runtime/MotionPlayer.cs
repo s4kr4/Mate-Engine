@@ -39,6 +39,12 @@ namespace VRMate
 
         public static MotionPlayer Instance { get; private set; }
 
+        /// <summary>A motion is showing or fading out; WalkPlayer neither starts nor keeps walking meanwhile.</summary>
+        public bool IsPlaying
+        {
+            get { return fade.IsActive; }
+        }
+
         /// <summary>
         /// Plays the motion if the avatar is idle now; a motion that is still loading plays when it is
         /// loaded, if it is still the newest request and the avatar is idle then.
