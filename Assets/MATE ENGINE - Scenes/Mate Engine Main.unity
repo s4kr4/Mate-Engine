@@ -159579,7 +159579,7 @@ MonoBehaviour:
   playerColor: {r: 1, g: 1, b: 1, a: 1}
   aiColor: {r: 1, g: 1, b: 1, a: 1}
   fontColor: {r: 1, g: 1, b: 1, a: 1}
-  font: {fileID: 12800000, guid: e3265ab4bf004d28a9537516768c1c75, type: 3}
+  font: {fileID: 12800000, guid: ea93ee27d43a3704c8815e9d4cdfcd5b, type: 3}
   fontSize: 20
   bubbleWidth: 500
   textPadding: 24
