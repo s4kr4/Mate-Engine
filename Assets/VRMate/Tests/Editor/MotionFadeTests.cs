@@ -7,6 +7,67 @@ namespace VRMate.Tests
 {
     public class MotionFadeTests
     {
+        private static void PlayHeld(MotionFade fade, long token, float length, float holdAt)
+        {
+            var method = typeof(MotionFade).GetMethod("Play", new[] { typeof(long), typeof(float), typeof(float?) });
+            Assert.That(method, Is.Not.Null, "保持時刻を指定できない");
+            method.Invoke(fade, new object[] { token, length, holdAt });
+        }
+
+        [Test]
+        public void Advance_HoldsPoseAtRequestedTimeUntilStopped()
+        {
+            var fade = new MotionFade();
+            PlayHeld(fade, 1, 4f, 1.25f);
+
+            fade.Advance(2f, true);
+            Assert.That(fade.IsActive, Is.True);
+            Assert.That(fade.Time, Is.EqualTo(1.25f).Within(Tolerance));
+            Assert.That(fade.Weight, Is.EqualTo(1f).Within(Tolerance));
+
+            fade.Advance(10f, true);
+            Assert.That(fade.IsActive, Is.True);
+            Assert.That(fade.Time, Is.EqualTo(1.25f).Within(Tolerance));
+            Assert.That(fade.Weight, Is.EqualTo(1f).Within(Tolerance));
+
+            fade.Stop();
+            AdvanceUntilInactive(fade, Frame);
+            Assert.That(fade.Weight, Is.EqualTo(0f));
+        }
+
+        [Test]
+        public void Play_ReplacesHeldPoseAfterFadeOut()
+        {
+            var fade = new MotionFade();
+            PlayHeld(fade, 1, 4f, 1.25f);
+            fade.Advance(2f, true);
+
+            fade.Play(2, 3f);
+            fade.Advance(MotionFade.StopFade / 2f, true);
+            Assert.That(fade.Token, Is.EqualTo(1L));
+            Assert.That(fade.Weight, Is.InRange(0f, 1f));
+
+            fade.Advance(MotionFade.StopFade / 2f, true);
+            Assert.That(fade.Token, Is.EqualTo(2L));
+            Assert.That(fade.Time, Is.EqualTo(0f));
+            Assert.That(fade.Weight, Is.EqualTo(0f));
+        }
+
+        [TestCase(0f)]
+        [TestCase(-0.1f)]
+        [TestCase(4f)]
+        [TestCase(5f)]
+        [TestCase(float.NaN)]
+        [TestCase(float.PositiveInfinity)]
+        public void Play_UsesOrdinaryPlaybackWhenHoldTimeIsOutsideClip(float holdAt)
+        {
+            var fade = new MotionFade();
+            PlayHeld(fade, 1, 4f, holdAt);
+
+            fade.Advance(4f, true);
+
+            Assert.That(fade.IsActive, Is.False);
+        }
         private const float Clip = 7.27f;
         private const float ShortClip = 0.3f;
         private const float Tolerance = 1e-4f;

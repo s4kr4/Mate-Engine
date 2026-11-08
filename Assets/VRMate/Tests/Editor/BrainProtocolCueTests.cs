@@ -19,6 +19,68 @@ namespace VRMate.Tests
 
         private static readonly string[] Expressions = { "happy", "angry", "sad", "relaxed", "surprised", "neutral" };
 
+        [Test]
+        public void Parse_KeepsHoldTimeOnSayMotionAndStandaloneMotion()
+        {
+            var say = ParseSay(SayJson("\"motion\":\"point\",\"hold_at\":1.25"));
+            var motion = BrainProtocol.Parse("{\"type\":\"motion\",\"name\":\"point\",\"hold_at\":1.25}");
+
+            Assert.That(say.Motion, Is.EqualTo("point"));
+            Assert.That(say.GetType().GetProperty("MotionHoldAt"), Is.Not.Null);
+            Assert.That(say.GetType().GetProperty("MotionHoldAt").GetValue(say), Is.EqualTo(1.25d));
+            Assert.That(motion, Is.InstanceOf<MotionMessage>());
+            Assert.That(motion.GetType().GetProperty("HoldAt"), Is.Not.Null);
+            Assert.That(motion.GetType().GetProperty("HoldAt").GetValue(motion), Is.EqualTo(1.25d));
+        }
+
+        [Test]
+        public void Parse_LeavesOrdinaryMotionWithoutHoldTime()
+        {
+            var say = ParseSay(SayJson("\"motion\":\"point\""));
+            var motion = BrainProtocol.Parse("{\"type\":\"motion\",\"name\":\"point\"}");
+
+            Assert.That(say.GetType().GetProperty("MotionHoldAt"), Is.Not.Null);
+            Assert.That(say.GetType().GetProperty("MotionHoldAt").GetValue(say), Is.Null);
+            Assert.That(motion, Is.InstanceOf<MotionMessage>());
+            Assert.That(motion.GetType().GetProperty("HoldAt").GetValue(motion), Is.Null);
+        }
+
+        [TestCase("0")]
+        [TestCase("-0.1")]
+        [TestCase("\"1.25\"")]
+        [TestCase("true")]
+        [TestCase("null")]
+        [TestCase("NaN")]
+        [TestCase("Infinity")]
+        public void Parse_DropsInvalidHoldTimeButKeepsValidSayMotion(string value)
+        {
+            var say = ParseSay(SayJson("\"motion\":\"point\",\"hold_at\":" + value));
+
+            Assert.That(say.Motion, Is.EqualTo("point"));
+            Assert.That(say.GetType().GetProperty("MotionHoldAt").GetValue(say), Is.Null);
+            Assert.That(say.Problems, Is.Not.Empty);
+        }
+
+        [TestCase("0")]
+        [TestCase("-0.1")]
+        [TestCase("\"1.25\"")]
+        [TestCase("true")]
+        [TestCase("null")]
+        [TestCase("NaN")]
+        [TestCase("Infinity")]
+        public void Parse_RejectsStandaloneMotionWithInvalidHoldTime(string value)
+        {
+            ParseInvalid("{\"type\":\"motion\",\"name\":\"point\",\"hold_at\":" + value + "}");
+        }
+
+        [Test]
+        public void Parse_RecognizesMotionStopWithoutName()
+        {
+            var message = BrainProtocol.Parse("{\"type\":\"motion_stop\"}");
+
+            Assert.That(message.GetType().Name, Is.EqualTo("MotionStopMessage"));
+        }
+
         private static string SayJson(string cueFields)
         {
             return "{\"type\":\"say\",\"id\":7,\"turn\":3,\"text\":\"こんにちは\",\"audio\":\"" + Audio + "\",\"visemes\":" + Visemes

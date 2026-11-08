@@ -18,9 +18,12 @@ namespace VRMate
         private bool _active;
         private bool _stopping;
         private float _length;
+        private float? _holdAt;
+        private float _blendTime;
         private bool _hasWaiting;
         private long _waitingToken;
         private float _waitingLength;
+        private float? _waitingHoldAt;
 
         public bool IsActive
         {
@@ -37,16 +40,21 @@ namespace VRMate
         public float Weight { get; private set; }
 
         /// <summary>Ignored unless length is positive and finite. Never changes Weight by itself.</summary>
-        public void Play(long token, float length)
+        public void Play(long token, float length, float? holdAt = null)
         {
             if (!(length > 0f) || float.IsInfinity(length))
             {
                 return;
             }
 
+            if (!holdAt.HasValue || !(holdAt.Value > 0f) || holdAt.Value >= length || float.IsInfinity(holdAt.Value))
+            {
+                holdAt = null;
+            }
+
             if (!_active)
             {
-                Start(token, length);
+                Start(token, length, holdAt);
                 return;
             }
 
@@ -55,6 +63,7 @@ namespace VRMate
             _hasWaiting = true;
             _waitingToken = token;
             _waitingLength = length;
+            _waitingHoldAt = holdAt;
         }
 
         /// <summary>Lowers the weight to 0 and drops a waiting request. Never changes Weight by itself.</summary>
@@ -91,14 +100,17 @@ namespace VRMate
             if (_stopping)
             {
                 // The clip end does not end a stop: a waiting request must still start once the weight is 0.
-                Time = Math.Min(Time + delta, _length);
+                if (!_holdAt.HasValue || Time < _holdAt.Value)
+                {
+                    Time = Math.Min(Time + delta, _length);
+                }
                 Weight = Math.Max(0f, Weight - delta / StopFade);
                 if (Weight <= 0f)
                 {
                     if (_hasWaiting)
                     {
                         // The new motion starts this frame from 0; the rest of delta belonged to the old one.
-                        Start(_waitingToken, _waitingLength);
+                        Start(_waitingToken, _waitingLength, _waitingHoldAt);
                     }
                     else
                     {
@@ -109,7 +121,14 @@ namespace VRMate
                 return;
             }
 
-            Time += delta;
+            Time = Math.Min(Time + delta, _holdAt ?? _length);
+            _blendTime += delta;
+            if (_holdAt.HasValue)
+            {
+                Weight = Math.Min(1f, _blendTime / FadeIn);
+                return;
+            }
+
             if (Time >= _length)
             {
                 End();
@@ -119,12 +138,14 @@ namespace VRMate
             Weight = Envelope(Time, _length);
         }
 
-        private void Start(long token, float length)
+        private void Start(long token, float length, float? holdAt)
         {
             _active = true;
             _stopping = false;
             _hasWaiting = false;
             _length = length;
+            _holdAt = holdAt;
+            _blendTime = 0f;
             Token = token;
             Time = 0f;
             Weight = 0f;

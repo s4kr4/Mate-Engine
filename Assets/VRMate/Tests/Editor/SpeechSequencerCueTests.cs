@@ -12,6 +12,36 @@ namespace VRMate.Tests
     /// </summary>
     public class SpeechSequencerCueTests
     {
+        [Test]
+        public void OnSay_PassesHoldTimeToMotionAction()
+        {
+            var sequencer = new SpeechSequencer();
+            var say = (SayMessage)BrainProtocol.Parse("{\"type\":\"say\",\"id\":1,\"turn\":1,\"text\":\"説明。\",\"motion\":\"point\",\"hold_at\":1.25}");
+
+            sequencer.OnSay(say);
+
+            var action = sequencer.DrainActions().OfType<PlayMotion>().Single();
+            var property = action.GetType().GetProperty("HoldAt");
+            Assert.That(property, Is.Not.Null);
+            Assert.That(property.GetValue(action), Is.EqualTo(1.25d));
+        }
+
+        [Test]
+        public void OnMotionStop_StopsHeldMotionWithoutCancellingSpeech()
+        {
+            var sequencer = new SpeechSequencer();
+            sequencer.OnSay(Say(SayKind.Audio, 1, motion: "point"));
+            Drain(sequencer);
+
+            var stop = typeof(SpeechSequencer).GetMethod("OnMotionStop");
+            Assert.That(stop, Is.Not.Null);
+            stop.Invoke(sequencer, null);
+
+            var actions = Drain(sequencer);
+            Assert.That(actions.Count, Is.EqualTo(1));
+            Assert.That(actions[0], Is.InstanceOf<StopMotion>());
+            Assert.That(sequencer.IsPlaying, Is.True);
+        }
         private static readonly string ValidAudio = WavBuilder.Pcm16Base64(new short[] { 0, 1000, -1000, 2000, -2000, 0 }, channels: 1, sampleRate: 24000);
         private static readonly string NotWavAudio = Convert.ToBase64String(Encoding.UTF8.GetBytes("not a wav file, only text"));
 
