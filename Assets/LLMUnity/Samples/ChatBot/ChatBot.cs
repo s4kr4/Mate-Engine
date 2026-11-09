@@ -77,11 +77,11 @@ namespace LLMUnitySamples
         private Animator lastAvatarAnimator;
 
         // VRMate: replies come from the brain through SpeechPlayer instead of LLMUnity.
-        private const string notConnectedPlaceholder = "頭脳につながっていません";
         private SpeechPlayer speechPlayer;
         // VRMate: the Markdown converter rewrites the bubble's text, so replies are written from the raw text kept in Core.
         private ReplyBubbleWriter<Bubble> aiReplyWriter;
-        private bool? placeholderConnected;
+        // VRMate: the brain reports push-to-talk; Core subscribes once, shows it in the placeholder and turns heard sentences into player bubbles.
+        private VoiceInputDisplay voiceInput;
 
 
         void Start()
@@ -134,7 +134,9 @@ namespace LLMUnitySamples
 
             // VRMate: no LLMUnity warm-up or history; input is open as soon as the panel exists.
             aiReplyWriter = new ReplyBubbleWriter<Bubble>(new AiBubbleView(this));
+            voiceInput = new VoiceInputDisplay(inputPlaceholder, new VoiceInputView(this));
             SubscribeSpeechPlayer();
+            voiceInput.Attach(BrainLink.Instance);
             warmUpDone = true;
             UpdateConnectionPlaceholder();
             AllowInput();
@@ -151,6 +153,8 @@ namespace LLMUnitySamples
         {
             if (speechPlayer != null) speechPlayer.TextAppended -= OnSpeechTextAppended;
             speechPlayer = null;
+            // VRMate: only here, not in OnDisable, so heard sentences still become bubbles while the panel is closed.
+            if (voiceInput != null) voiceInput.Detach();
         }
 
         void OnSpeechTextAppended(long connection, long turn, string text)
@@ -176,12 +180,23 @@ namespace LLMUnitySamples
             public bool IsShown(Bubble bubble) { return owner.chatBubbles.Contains(bubble); }
         }
 
+        // VRMate: lets the Core display add heard sentences as player bubbles and set the placeholder.
+        // BrainLink raises heard in arrival order, before SpeechPlayer starts any say of its reply, so it lands above the reply bubble.
+        private sealed class VoiceInputView : IVoiceInputView
+        {
+            private readonly ChatBot owner;
+
+            public VoiceInputView(ChatBot owner) { this.owner = owner; }
+
+            public void AddPlayerBubble(string text) { owner.AddBubble(text, true); }
+
+            public void SetPlaceholder(string text) { owner.inputBubble.SetPlaceHolderText(text); }
+        }
+
+        // VRMate: Core writes the placeholder only when its text changes, so this is cheap to call every frame.
         void UpdateConnectionPlaceholder()
         {
-            bool connected = BrainLink.Instance != null && BrainLink.Instance.IsConnected;
-            if (placeholderConnected == connected) return;
-            placeholderConnected = connected;
-            inputBubble.SetPlaceHolderText(connected ? inputPlaceholder : notConnectedPlaceholder);
+            voiceInput.Tick(BrainLink.Instance != null && BrainLink.Instance.IsConnected);
         }
 
         void FindAvatarSmart()
@@ -405,6 +420,7 @@ namespace LLMUnitySamples
         {
             RefreshAvatarIfChanged();
             SubscribeSpeechPlayer();
+            voiceInput.Attach(BrainLink.Instance);
             UpdateConnectionPlaceholder();
 
             if (!inputBubble.inputFocused() && warmUpDone)

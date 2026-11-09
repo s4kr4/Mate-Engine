@@ -12,6 +12,9 @@ namespace VRMate.Tests
     /// サンプルの ChatBot（Assembly-CSharp）が AI の返事を ReplyBubbleWriter に任せていること、
     /// GetText() を入力欄（inputBubble）のほかから呼ばないことをソースで確かめる。
     /// 返事ごとの吹き出しの作り直しと文字列のつなぎ方は ReplyBubbleWriter が受け持ち、その振る舞いは ReplyBubbleWriterTests で確かめる。
+    /// 音声入力の表示（listen を入力欄のプレースホルダーに、heard をユーザーの吹き出しに）も VoiceInputDisplay に任せていること、
+    /// つまり Update で Attach と Tick を、OnDestroy で Detach を呼び、IVoiceInputView を実装する入れ子クラスが受け取った文を吹き出しと入力欄へそのまま渡すことを確かめる。
+    /// 購読の回数・解除・文が変わったときだけ書く判断は VoiceInputDisplay が受け持ち、その振る舞いは VoiceInputDisplayTests で確かめる。
     /// asmdef から Assembly-CSharp は参照できないので、ソースファイルを読み、コメントと文字列リテラルの中身を除いて調べる。
     /// 空白・改行・this. の違いは同じ形として扱う。
     /// </summary>
@@ -24,6 +27,15 @@ namespace VRMate.Tests
         private const string SourceOverrideVariable = "VRMATE_TEST_CHATBOT_SOURCE";
 
         private static readonly Regex WriterField = new Regex(@"(?<![\w.])ReplyBubbleWriter\s*<\s*Bubble\s*>\s+@?([A-Za-z_]\w*)\s*[;=]");
+
+        private const string DisplayType = "VoiceInputDisplay";
+
+        // 接続していないときの文は VoiceInputDisplay（InputPlaceholder）が持つ
+        private const string NotConnectedText = "頭脳につながっていません";
+
+        private static readonly Regex DisplayField = new Regex(@"(?<![\w.])(?:VRMate\s*\.\s*)?VoiceInputDisplay\s+@?([A-Za-z_]\w*)\s*[;=]");
+
+        private static readonly Regex IsConnectedRead = new Regex(@"(?<![\w@])@?IsConnected(?!\w)");
 
         /// <summary>ソースの一部（本文など）と、ソース全体の中での開始位置。</summary>
         private sealed class Span
@@ -291,6 +303,144 @@ namespace VRMate.Tests
             return names;
         }
 
+        /// <summary>ChatBot の直下に宣言された VoiceInputDisplay 型のフィールドの名前。1 つも無ければテストを失敗させる。</summary>
+        private static List<string> DisplayFieldNames(Span chatBot)
+        {
+            var names = DisplayField.Matches(chatBot.Text).Cast<Match>()
+                .Where(m => Depth(chatBot, chatBot.Start + m.Index) == 0)
+                .Select(m => m.Groups[1].Value)
+                .ToList();
+            Assert.That(names, Is.Not.Empty, "ChatBot に " + DisplayType + " 型のフィールドが無い");
+            return names;
+        }
+
+        /// <summary>Squash した本文で、フィールドのどれかを受け手にした「名前.method(」の呼び出しに合う正規表現の文字列。?. も受け付ける。</summary>
+        private static string CallOn(List<string> fields, string method)
+        {
+            var receivers = string.Join("|", fields.Select(Regex.Escape));
+            return @"(?<![\w.@])@?(?:" + receivers + @")\??\.@?" + method + @"\(";
+        }
+
+        /// <summary>
+        /// Squash した本文 body の位置 index が、{ } の外にある文の先頭か。直前が本文の始まり・}・; のどれかなら文の先頭とみなす。
+        /// if・else・while などの直後（波かっこなしの条件の中）や、ラムダの中は文の先頭ではない。
+        /// </summary>
+        private static bool IsTopLevelStatement(string body, int index)
+        {
+            if (Depth(new Span(body, 0), index) != 0)
+            {
+                return false;
+            }
+
+            var before = body.Substring(0, index).TrimEnd();
+            return before.Length == 0 || before.EndsWith("}") || before.EndsWith(";");
+        }
+
+        /// <summary>
+        /// Tick の引数 argument（Squash 済み）が IsConnected を読む式か。名前付き引数も受け付ける。
+        /// 引数が 1 つの名前なら、同じ本文 body で IsConnected を読む式から初期化したローカル変数（bool か var）でもよい。
+        /// </summary>
+        private static bool ReadsIsConnected(string body, string argument)
+        {
+            var value = Regex.Replace(argument, @"^@?[A-Za-z_]\w*:(?!:)", string.Empty);
+            if (IsConnectedRead.IsMatch(value))
+            {
+                return true;
+            }
+
+            var local = Regex.Match(value, @"^@?([A-Za-z_]\w*)$");
+            if (!local.Success)
+            {
+                return false;
+            }
+
+            var declaration = new Regex(@"(?<![\w.@])(?:bool|var) ?@?" + Regex.Escape(local.Groups[1].Value) + @"=([^;]*);");
+            return declaration.Matches(body).Cast<Match>().Any(m => IsConnectedRead.IsMatch(m.Groups[1].Value));
+        }
+
+        /// <summary>Squash した本文 body の文の先頭で、tick（「フィールド.Tick(」）を IsConnected を読む引数で呼んでいるか。</summary>
+        private static bool TicksWithConnection(string body, Regex tick)
+        {
+            foreach (Match call in tick.Matches(body))
+            {
+                if (!IsTopLevelStatement(body, call.Index))
+                {
+                    continue;
+                }
+
+                var open = call.Index + call.Length - 1;
+                var close = Matching(body, open);
+                if (ReadsIsConnected(body, body.Substring(open + 1, close - open - 1)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>Squash した Update の本文の文の先頭で呼んでいる、ChatBot の直下の引数なしの void メソッドの本文（Squash 済み）。</summary>
+        private static List<string> TopLevelHelperBodies(Span chatBot, string update)
+        {
+            var bodies = new List<string>();
+            foreach (Match call in new Regex(@"(?<![\w.@])@?([A-Za-z_]\w*)\(\)").Matches(update))
+            {
+                if (!IsTopLevelStatement(update, call.Index))
+                {
+                    continue;
+                }
+
+                var name = call.Groups[1].Value;
+                var declarations = new Regex(@"(?<![\w.])void\s+@?" + name + @"\s*\(([^()]*)\)\s*(\{|=>)").Matches(chatBot.Text).Cast<Match>()
+                    .Where(m => Depth(chatBot, chatBot.Start + m.Index) == 0)
+                    .ToList();
+                if (declarations.Count != 1 || declarations[0].Groups[1].Value.Trim().Length > 0)
+                {
+                    continue;
+                }
+
+                bodies.Add(Squash(FindVoidMethod(chatBot, name).Body.Text));
+            }
+
+            return bodies;
+        }
+
+        /// <summary>ChatBot の直下にある、IVoiceInputView を実装する入れ子クラスの本文。ちょうど 1 つでなければテストを失敗させる。クラス名は問わない。</summary>
+        private static Span VoiceInputViewBody(Span chatBot)
+        {
+            var declarations = new Regex(@"(?<![\w.])class\s+@?[A-Za-z_]\w*\s*:([^{;]*)\{").Matches(chatBot.Text).Cast<Match>()
+                .Where(m => Depth(chatBot, chatBot.Start + m.Index) == 0)
+                .Where(m => Regex.IsMatch(m.Groups[1].Value, @"(?<!\w)IVoiceInputView(?!\w)"))
+                .ToList();
+            Assert.That(declarations.Count, Is.EqualTo(1), "ChatBot の中に IVoiceInputView を実装するクラスがちょうど 1 つ見つからない");
+
+            var open = declarations[0].Index + declarations[0].Length - 1;
+            var body = BlockAt(chatBot.Text, open);
+            return new Span(body.Text, chatBot.Start + body.Start);
+        }
+
+        /// <summary>入れ子の view の、パラメーターがちょうど 1 つの void メソッド name。パラメーター名と Squash した本文を返す。</summary>
+        private static KeyValuePair<string, string> ViewMethod(Span view, string name)
+        {
+            var method = FindVoidMethod(view, name);
+            Assert.That(method.ParameterNames.Count, Is.EqualTo(1), name + " のパラメーターが 1 つではない");
+            return new KeyValuePair<string, string>(method.ParameterNames[0], Squash(method.Body.Text));
+        }
+
+        /// <summary>コメントだけを除いたソース（文字列・文字リテラルの中身は残す）。</summary>
+        private static string ReadSourceKeepingLiterals()
+        {
+            var source = File.ReadAllText(SourcePath());
+            var masked = MaskCommentsAndLiterals(source);
+            var result = new StringBuilder(source.Length);
+            for (var i = 0; i < source.Length; i++)
+            {
+                result.Append(masked[i] == '_' ? source[i] : masked[i]);
+            }
+
+            return result.ToString();
+        }
+
         [Test]
         public void OnSpeechTextAppended_DelegatesToReplyBubbleWriter()
         {
@@ -320,6 +470,122 @@ namespace VRMate.Tests
                 var receiver = Regex.IsMatch(squashed.Substring(0, call.Index), @"(?<![\w.@])@?inputBubble\??\.$");
                 Assert.That(receiver, Is.True, "inputBubble のほかから GetText() を読んでいる: " + around);
             }
+        }
+
+        // ---- 音声入力の表示は VoiceInputDisplay に任せる ----
+
+        /// <summary>
+        /// Update は、本文の直下（条件の中でない文）で VoiceInputDisplay のフィールドの Attach(BrainLink.Instance) と、
+        /// IsConnected を読む式を渡す Tick を呼ぶ。Tick は、Update の本文の直下で呼ぶ引数なしの補助メソッドの本文の直下でもよい。
+        /// </summary>
+        [Test]
+        public void Update_AttachesBrainLinkAndTicksWithConnection_InTopLevelStatements()
+        {
+            var chatBot = ClassBody(ReadSource(), "ChatBot");
+            var fields = DisplayFieldNames(chatBot);
+            var update = Squash(FindVoidMethod(chatBot, "Update").Body.Text);
+
+            var attach = new Regex(CallOn(fields, "Attach") + @"(?:source:)?(?:VRMate\.)?BrainLink\.Instance\)");
+            var attached = attach.Matches(update).Cast<Match>().Any(call => IsTopLevelStatement(update, call.Index));
+            Assert.That(attached, Is.True, "Update の本文の直下（条件の中でない文）に「" + fields[0] + ".Attach(BrainLink.Instance)」が無い:\n  " + update);
+
+            var tick = new Regex(CallOn(fields, "Tick"));
+            var ticked = TicksWithConnection(update, tick) || TopLevelHelperBodies(chatBot, update).Any(helper => TicksWithConnection(helper, tick));
+            Assert.That(ticked, Is.True, "Update（または Update の直下で呼ぶ補助メソッド）の本文の直下に、IsConnected を読む式を渡す「" + fields[0] + ".Tick(...)」が無い:\n  " + update);
+        }
+
+        /// <summary>OnDestroy は VoiceInputDisplay のフィールドの Detach() を呼ぶ。</summary>
+        [Test]
+        public void OnDestroy_DetachesVoiceInputDisplay()
+        {
+            var chatBot = ClassBody(ReadSource(), "ChatBot");
+            var fields = DisplayFieldNames(chatBot);
+            var onDestroy = Squash(FindVoidMethod(chatBot, "OnDestroy").Body.Text);
+
+            var detach = new Regex(CallOn(fields, "Detach") + @"\)");
+            Assert.That(detach.IsMatch(onDestroy), Is.True, "OnDestroy の本文に「" + fields[0] + ".Detach()」の呼び出しが無い:\n  " + onDestroy);
+        }
+
+        /// <summary>ChatBot は OnDestroy のほかでは Detach を呼ばない（パネルを閉じても heard は吹き出しになる）。</summary>
+        [Test]
+        public void ChatBot_CallsDetachOnlyFromOnDestroy()
+        {
+            var chatBot = ClassBody(ReadSource(), "ChatBot");
+            var onDestroy = FindVoidMethod(chatBot, "OnDestroy").Body;
+
+            var outside = new List<string>();
+            foreach (Match call in new Regex(@"(?<![\w@])@?Detach\s*\(").Matches(chatBot.Text))
+            {
+                var index = chatBot.Start + call.Index;
+                if (index >= onDestroy.Start && index < onDestroy.Start + onDestroy.Text.Length)
+                {
+                    continue;
+                }
+
+                var from = System.Math.Max(0, call.Index - 60);
+                outside.Add(Squash(chatBot.Text.Substring(from, System.Math.Min(chatBot.Text.Length, call.Index + 20) - from)));
+            }
+
+            Assert.That(outside, Is.Empty, "OnDestroy のほかで Detach を呼んでいる:\n  " + string.Join("\n  ", outside));
+        }
+
+        /// <summary>IVoiceInputView を実装する ChatBot の入れ子クラスの AddPlayerBubble は、受け取った文をそのまま AddBubble(文, true) に渡す。</summary>
+        [Test]
+        public void VoiceInputView_AddPlayerBubble_PassesTextAsIsToAddBubbleAsPlayer()
+        {
+            var view = VoiceInputViewBody(ClassBody(ReadSource(), "ChatBot"));
+            var method = ViewMethod(view, "AddPlayerBubble");
+
+            var text = "@?" + Regex.Escape(method.Key);
+            var addBubble = new Regex(@"(?<![\w@])@?AddBubble\((?:(?:message:)?" + text + @",(?:isPlayerMessage:)?true|isPlayerMessage:true,message:" + text + @")\)");
+            Assert.That(addBubble.IsMatch(method.Value), Is.True, "AddPlayerBubble の本文に「AddBubble(" + method.Key + ", true)」の呼び出しが無い:\n  " + method.Value);
+        }
+
+        /// <summary>IVoiceInputView を実装する ChatBot の入れ子クラスの SetPlaceholder は、受け取った文をそのまま SetPlaceHolderText(文) に渡す。</summary>
+        [Test]
+        public void VoiceInputView_SetPlaceholder_PassesTextAsIsToSetPlaceHolderText()
+        {
+            var view = VoiceInputViewBody(ClassBody(ReadSource(), "ChatBot"));
+            var method = ViewMethod(view, "SetPlaceholder");
+
+            var setPlaceHolderText = new Regex(@"(?<![\w@])@?SetPlaceHolderText\((?:text:)?@?" + Regex.Escape(method.Key) + @"\)");
+            Assert.That(setPlaceHolderText.IsMatch(method.Value), Is.True, "SetPlaceholder の本文に「SetPlaceHolderText(" + method.Key + ")」の呼び出しが無い:\n  " + method.Value);
+        }
+
+        /// <summary>IVoiceInputView を実装する ChatBot の入れ子クラスの AddPlayerBubble と SetPlaceholder は、SendInput も TrySend も呼ばない（聞き取った文を頭脳へ送り返さない）。</summary>
+        [Test]
+        public void VoiceInputView_DoesNotSendToBrain()
+        {
+            var view = VoiceInputViewBody(ClassBody(ReadSource(), "ChatBot"));
+            var send = new Regex(@"(?<![\w@])@?(?:SendInput|TrySend)(?!\w)");
+
+            foreach (var name in new[] { "AddPlayerBubble", "SetPlaceholder" })
+            {
+                var body = ViewMethod(view, name).Value;
+                Assert.That(send.IsMatch(body), Is.False, name + " が SendInput か TrySend を呼んでいる:\n  " + body);
+            }
+        }
+
+        /// <summary>ChatBot は BrainLink のイベント（Heard・ListenChanged・Disconnected）を自分で購読しない。</summary>
+        [Test]
+        public void ChatBot_DoesNotSubscribeBrainLinkEventsItself()
+        {
+            var squashed = Squash(ReadSource());
+
+            var subscriptions = new Regex(@"(?<![\w@])@?(?:Heard|ListenChanged|Disconnected)(?:\+=|-=)").Matches(squashed).Cast<Match>()
+                .Select(m => squashed.Substring(System.Math.Max(0, m.Index - 30), System.Math.Min(squashed.Length, m.Index + 50) - System.Math.Max(0, m.Index - 30)))
+                .ToList();
+            Assert.That(subscriptions, Is.Empty, "ChatBot が BrainLink のイベントを自分で購読・解除している:\n  " + string.Join("\n  ", subscriptions));
+        }
+
+        /// <summary>ChatBot は「頭脳につながっていません」の文を自前で持たない（コメントは除く）。</summary>
+        [Test]
+        public void ChatBot_DoesNotHoldNotConnectedText()
+        {
+            ReadSource();
+            var code = ReadSourceKeepingLiterals();
+
+            Assert.That(code.Contains(NotConnectedText), Is.False, "ChatBot.cs のコードに「" + NotConnectedText + "」の文がある");
         }
     }
 }

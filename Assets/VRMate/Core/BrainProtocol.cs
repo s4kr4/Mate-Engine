@@ -147,6 +147,10 @@ namespace VRMate
                     return InterpretCueMessage(obj, CueKind.Expression);
                 case "motion":
                     return InterpretCueMessage(obj, CueKind.Motion);
+                case "listen":
+                    return InterpretListen(obj);
+                case "heard":
+                    return InterpretHeard(obj);
                 default:
                     return new IgnoredMessage("unknown type '" + Shorten(type) + "'");
             }
@@ -265,6 +269,69 @@ namespace VRMate
             }
 
             name = value;
+            return true;
+        }
+
+        /// <summary>
+        /// Only the exact names count (ordinal, after JSON unescaping; no case folding, trimming or
+        /// normalization). Any other string is a state this avatar does not know and is ignored.
+        /// </summary>
+        private static BrainMessage InterpretListen(JObject obj)
+        {
+            string state;
+            string problem;
+            if (!TryReadString(obj, "listen: state", "state", out state, out problem))
+            {
+                return new InvalidMessage(null, problem);
+            }
+
+            switch (state)
+            {
+                case "recording":
+                    return new ListenMessage(ListenState.Recording);
+                case "recognizing":
+                    return new ListenMessage(ListenState.Recognizing);
+                case "idle":
+                    return new ListenMessage(ListenState.Idle);
+                default:
+                    return new IgnoredMessage("listen: unknown state '" + Shorten(state) + "'");
+            }
+        }
+
+        private static BrainMessage InterpretHeard(JObject obj)
+        {
+            string text;
+            string problem;
+            if (!TryReadString(obj, "heard: text", "text", out text, out problem))
+            {
+                return new InvalidMessage(null, problem);
+            }
+
+            return new HeardMessage(text);
+        }
+
+        /// <summary>
+        /// The problem names only the JSON type of a non-string (never its text), so its length is
+        /// bounded whatever the input.
+        /// </summary>
+        private static bool TryReadString(JObject obj, string where, string key, out string value, out string problem)
+        {
+            value = null;
+            problem = null;
+            JToken token;
+            if (!obj.TryGetValue(key, out token))
+            {
+                problem = where + " is missing";
+                return false;
+            }
+
+            if (token.Type != JTokenType.String)
+            {
+                problem = where + " is not a string (" + token.Type + ")";
+                return false;
+            }
+
+            value = (string)token;
             return true;
         }
 
