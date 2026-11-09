@@ -16,7 +16,7 @@ namespace VRMate
     /// (expressions and motions included, so that cancel and disconnect undo them in order).
     /// </summary>
     [DisallowMultipleComponent]
-    public class BrainLink : MonoBehaviour
+    public class BrainLink : MonoBehaviour, IVoiceInputSource
     {
         public string url = "ws://127.0.0.1:48021";
 
@@ -28,6 +28,18 @@ namespace VRMate
         private LinkClient client;
 
         public static BrainLink Instance { get; private set; }
+
+        /// <summary>
+        /// Raised on the main thread with a sentence the brain heard, in the order the brain sent it, so it
+        /// comes before the says of its reply (which SpeechPlayer shows only when they start).
+        /// </summary>
+        public event Action<string> Heard;
+
+        /// <summary>Raised on the main thread when the brain sends a listen state.</summary>
+        public event Action<ListenState> ListenChanged;
+
+        /// <summary>Raised on the main thread after the connection to the brain is lost.</summary>
+        public event Action Disconnected;
 
         public bool IsConnected
         {
@@ -115,6 +127,9 @@ namespace VRMate
                     break;
                 case LinkEventKind.Disconnected:
                     Debug.Log("[VRMate] disconnected from the brain");
+
+                    // Raise never throws, so the speech player below is always reset.
+                    Raise(Disconnected);
                     if (SpeechPlayer.Instance != null)
                     {
                         SpeechPlayer.Instance.OnDisconnected();
@@ -183,6 +198,20 @@ namespace VRMate
                 return;
             }
 
+            var listen = message as ListenMessage;
+            if (listen != null)
+            {
+                Raise(ListenChanged, listen.State);
+                return;
+            }
+
+            var heard = message as HeardMessage;
+            if (heard != null)
+            {
+                Raise(Heard, heard.Text);
+                return;
+            }
+
             var invalid = message as InvalidMessage;
             if (invalid != null && invalid.IsCue)
             {
@@ -205,6 +234,48 @@ namespace VRMate
 
             var ignored = message as IgnoredMessage;
             Debug.LogWarning("[VRMate] ignored message (" + (ignored != null ? ignored.Reason : "unknown") + "): " + Shorten(text));
+        }
+
+        // A multicast delegate stops at the first handler that throws; call each one on its own so that
+        // a failing subscriber neither hides the event from the others nor stops the rest of the frame.
+        private static void Raise(Action handler)
+        {
+            if (handler == null)
+            {
+                return;
+            }
+
+            foreach (var each in handler.GetInvocationList())
+            {
+                try
+                {
+                    ((Action)each)();
+                }
+                catch (Exception e)
+                {
+                    Debug.LogException(e);
+                }
+            }
+        }
+
+        private static void Raise<T>(Action<T> handler, T value)
+        {
+            if (handler == null)
+            {
+                return;
+            }
+
+            foreach (var each in handler.GetInvocationList())
+            {
+                try
+                {
+                    ((Action<T>)each)(value);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogException(e);
+                }
+            }
         }
 
         /// <summary>Logs only the first time key is seen.</summary>

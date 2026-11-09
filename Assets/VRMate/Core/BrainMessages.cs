@@ -110,6 +110,39 @@ namespace VRMate
         public string Name { get; }
     }
 
+    /// <summary>Where the brain is in a push-to-talk turn.</summary>
+    public enum ListenState
+    {
+        Idle,
+        Recording,
+        Recognizing,
+    }
+
+    public sealed class ListenMessage : BrainMessage
+    {
+        public ListenMessage(ListenState state)
+        {
+            State = state;
+        }
+
+        public ListenState State { get; }
+    }
+
+    public sealed class HeardMessage : BrainMessage
+    {
+        public HeardMessage(string text)
+        {
+            Text = text;
+        }
+
+        /// <summary>
+        /// A sentence the brain recognized and queued, as the decoded JSON string (possibly empty): an unpaired
+        /// surrogate escaped as \uXXXX is read as U+FFFD, a surrogate pair is kept. It arrives before any say
+        /// of the reply to it.
+        /// </summary>
+        public string Text { get; }
+    }
+
     public sealed class IgnoredMessage : BrainMessage
     {
         public IgnoredMessage(string reason)
