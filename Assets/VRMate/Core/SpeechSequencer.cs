@@ -68,13 +68,16 @@ namespace VRMate
 
     public sealed class PlayMotion : SpeechAction
     {
-        public PlayMotion(string name)
+        public PlayMotion(string name, double? holdAt = null)
         {
             Name = name;
+            HoldAt = holdAt;
         }
 
         /// <summary>Accepted by CueNames.IsMotion.</summary>
         public string Name { get; }
+
+        public double? HoldAt { get; }
     }
 
     public sealed class StopMotion : SpeechAction
@@ -160,11 +163,21 @@ namespace VRMate
         }
 
         /// <summary>Played at once, without touching the says; names CueNames.IsMotion refuses are ignored.</summary>
-        public void OnMotion(string name)
+        public void OnMotion(string name, double? holdAt = null)
         {
             if (CueNames.IsMotion(name))
             {
-                ShowMotion(name);
+                ShowMotion(name, holdAt);
+            }
+        }
+
+        /// <summary>Releases a motion without interrupting speech.</summary>
+        public void OnMotionStop()
+        {
+            if (_motionShown)
+            {
+                _motionShown = false;
+                _actions.Add(new StopMotion());
             }
         }
 
@@ -210,7 +223,7 @@ namespace VRMate
         private void ShowCues(SayMessage say)
         {
             OnExpression(say.Expression);
-            OnMotion(say.Motion);
+            OnMotion(say.Motion, say.MotionHoldAt);
         }
 
         private void ShowExpression(string name)
@@ -219,10 +232,10 @@ namespace VRMate
             _actions.Add(new SetExpression(name));
         }
 
-        private void ShowMotion(string name)
+        private void ShowMotion(string name, double? holdAt)
         {
             _motionShown = true;
-            _actions.Add(new PlayMotion(name));
+            _actions.Add(new PlayMotion(name, holdAt));
         }
 
         private void RunPending()

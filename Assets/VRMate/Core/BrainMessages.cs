@@ -43,7 +43,8 @@ namespace VRMate
             IReadOnlyList<VisemeKey> visemes,
             string expression = null,
             string motion = null,
-            IReadOnlyList<string> problems = null)
+            IReadOnlyList<string> problems = null,
+            double? motionHoldAt = null)
         {
             Id = id;
             Turn = turn;
@@ -53,6 +54,7 @@ namespace VRMate
             Visemes = visemes;
             Expression = expression;
             Motion = motion;
+            MotionHoldAt = motionHoldAt;
             Problems = problems == null || problems.Count == 0 ? NoProblems : new List<string>(problems).AsReadOnly();
         }
 
@@ -76,6 +78,9 @@ namespace VRMate
 
         /// <summary>A name accepted by CueNames.IsMotion, or null when absent or unusable.</summary>
         public string Motion { get; }
+
+        /// <summary>Seconds into the motion to hold, or null for one-shot playback.</summary>
+        public double? MotionHoldAt { get; }
 
         /// <summary>
         /// Why an unusable expression or motion was dropped; the say itself still plays. Never null.
@@ -101,13 +106,20 @@ namespace VRMate
 
     public sealed class MotionMessage : BrainMessage
     {
-        public MotionMessage(string name)
+        public MotionMessage(string name, double? holdAt = null)
         {
             Name = name;
+            HoldAt = holdAt;
         }
 
         /// <summary>Accepted by CueNames.IsMotion.</summary>
         public string Name { get; }
+
+        public double? HoldAt { get; }
+    }
+
+    public sealed class MotionStopMessage : BrainMessage
+    {
     }
 
     /// <summary>Where the brain is in a push-to-talk turn.</summary>

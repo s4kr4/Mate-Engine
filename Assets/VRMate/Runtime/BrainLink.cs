@@ -192,7 +192,17 @@ namespace VRMate
             {
                 if (SpeechPlayer.Instance != null)
                 {
-                    SpeechPlayer.Instance.OnMotion(motion.Name);
+                    SpeechPlayer.Instance.OnMotion(motion.Name, motion.HoldAt);
+                }
+
+                return;
+            }
+
+            if (message is MotionStopMessage)
+            {
+                if (SpeechPlayer.Instance != null)
+                {
+                    SpeechPlayer.Instance.OnMotionStop();
                 }
 
                 return;

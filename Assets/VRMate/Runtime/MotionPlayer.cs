@@ -31,6 +31,7 @@ namespace VRMate
 
         // The newest Play whose file was still loading; any later Play or Stop replaces it.
         private string requested;
+        private float? requestedHoldAt;
 
         private Animator avatarAnimator;
         private HumanPoseHandler avatarPose;
@@ -49,9 +50,10 @@ namespace VRMate
         /// Plays the motion if the avatar is idle now; a motion that is still loading plays when it is
         /// loaded, if it is still the newest request and the avatar is idle then.
         /// </summary>
-        public void Play(string name)
+        public void Play(string name, double? holdAt = null)
         {
             requested = null;
+            requestedHoldAt = null;
             string path;
             if (!MotionFiles.TryGetPath(folder, name, out path))
             {
@@ -70,13 +72,14 @@ namespace VRMate
             {
                 if (CanPlay())
                 {
-                    fade.Play(motion.Token, motion.Clip.length);
+                    fade.Play(motion.Token, motion.Clip.length, holdAt.HasValue ? (float?)holdAt.Value : null);
                 }
 
                 return;
             }
 
             requested = name;
+            requestedHoldAt = holdAt.HasValue ? (float?)holdAt.Value : null;
             if (loading.Add(name))
             {
                 Load(name, path);
@@ -87,6 +90,7 @@ namespace VRMate
         public void Stop()
         {
             requested = null;
+            requestedHoldAt = null;
             fade.Stop();
         }
 
@@ -245,6 +249,7 @@ namespace VRMate
                 if (IsRequested(name))
                 {
                     requested = null;
+                    requestedHoldAt = null;
                 }
 
                 Warn("load:" + name, "cannot load motion '" + name + "' from " + path + ": " + error);
@@ -258,9 +263,11 @@ namespace VRMate
             if (IsRequested(name))
             {
                 requested = null;
+                var holdAt = requestedHoldAt;
+                requestedHoldAt = null;
                 if (CanPlay())
                 {
-                    fade.Play(motion.Token, motion.Clip.length);
+                    fade.Play(motion.Token, motion.Clip.length, holdAt);
                 }
             }
         }

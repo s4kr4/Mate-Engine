@@ -66,9 +66,15 @@ namespace VRMate
         }
 
         /// <summary>A standalone motion message: played at once, and stopped by cancel and disconnect.</summary>
-        public void OnMotion(string name)
+        public void OnMotion(string name, double? holdAt = null)
         {
-            sequencer.OnMotion(name);
+            sequencer.OnMotion(name, holdAt);
+            RunActions();
+        }
+
+        public void OnMotionStop()
+        {
+            sequencer.OnMotionStop();
             RunActions();
         }
 
@@ -219,7 +225,7 @@ namespace VRMate
             {
                 if (MotionPlayer.Instance != null)
                 {
-                    MotionPlayer.Instance.Play(playMotion.Name);
+                    MotionPlayer.Instance.Play(playMotion.Name, playMotion.HoldAt);
                 }
 
                 return;

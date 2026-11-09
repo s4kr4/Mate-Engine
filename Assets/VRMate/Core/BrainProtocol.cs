@@ -147,6 +147,8 @@ namespace VRMate
                     return InterpretCueMessage(obj, CueKind.Expression);
                 case "motion":
                     return InterpretCueMessage(obj, CueKind.Motion);
+                case "motion_stop":
+                    return new MotionStopMessage();
                 case "listen":
                     return InterpretListen(obj);
                 case "heard":
@@ -196,8 +198,25 @@ namespace VRMate
             var problems = new List<string>(2);
             var expression = ReadSayCue(obj, CueKind.Expression, problems);
             var motion = ReadSayCue(obj, CueKind.Motion, problems);
+            double? holdAt = null;
+            if (motion != null)
+            {
+                JToken holdToken;
+                if (obj.TryGetValue("hold_at", out holdToken))
+                {
+                    double seconds;
+                    if (TryGetFiniteDouble(holdToken, out seconds) && seconds > 0)
+                    {
+                        holdAt = seconds;
+                    }
+                    else
+                    {
+                        problems.Add("say: hold_at must be a positive finite number");
+                    }
+                }
+            }
 
-            return new SayMessage(id, turn, (string)textToken, hasAudio, audio, ReadVisemes(visemesToken), expression, motion, problems);
+            return new SayMessage(id, turn, (string)textToken, hasAudio, audio, ReadVisemes(visemesToken), expression, motion, problems, holdAt);
         }
 
         private enum CueKind
@@ -243,7 +262,24 @@ namespace VRMate
                 return new InvalidMessage(null, problem, isCue: true);
             }
 
-            return kind == CueKind.Expression ? (BrainMessage)new ExpressionMessage(name) : new MotionMessage(name);
+            if (kind == CueKind.Expression)
+            {
+                return new ExpressionMessage(name);
+            }
+
+            JToken holdToken;
+            if (!obj.TryGetValue("hold_at", out holdToken))
+            {
+                return new MotionMessage(name);
+            }
+
+            double seconds;
+            if (!TryGetFiniteDouble(holdToken, out seconds) || !(seconds > 0))
+            {
+                return new InvalidMessage(null, "motion: hold_at must be a positive finite number", isCue: true);
+            }
+
+            return new MotionMessage(name, seconds);
         }
 
         /// <summary>
